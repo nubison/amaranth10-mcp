@@ -7,7 +7,7 @@
 - 그룹웨어 주소는 브라우저 주소창의 URL을 그대로 붙여 넣어도 됩니다. HTTPS 주소만 지원합니다.
 - 입력한 비밀번호는 화면에 표시되지 않으며, 로그인에 실패하면 접속 정보를 저장하지 않습니다.
 - 사용자 범위(`user`)에 등록하므로 다른 프로젝트에서도 사용할 수 있습니다.
-- 설치한 버전(`v0.8.0`)은 자동으로 업데이트되지 않습니다. 새 버전을 사용하려면 명령의 버전 태그를 바꿔 setup을 다시 실행하세요.
+- 설치한 버전(`v0.8.1`)은 자동으로 업데이트되지 않습니다. 새 버전을 사용하려면 명령의 버전 태그를 바꿔 setup을 다시 실행하세요.
 - setup을 마치면 Claude Desktop과 환경변수 방식에 사용할 설정도 출력됩니다.
 
 ## 환경변수로 설정
@@ -19,7 +19,7 @@
   "mcpServers": {
     "amaranth10": {
       "command": "npx",
-      "args": ["-y", "github:nubison/amaranth10-mcp#v0.8.0"],
+      "args": ["-y", "github:nubison/amaranth10-mcp#v0.8.1"],
       "env": {
         "AMARANTH_URL": "https://gw.example.com",
         "AMARANTH_ID": "${AMARANTH_ID}",

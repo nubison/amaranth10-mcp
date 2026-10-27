@@ -15,7 +15,7 @@
 Node.js 20 이상과 Git이 필요합니다.
 
 ```bash
-npx -y github:nubison/amaranth10-mcp#v0.8.0 setup
+npx -y github:nubison/amaranth10-mcp#v0.8.1 setup
 ```
 
 주소·아이디·비밀번호를 입력하고 Claude Code 등록에 동의한 뒤, Claude Code를 새로 열면 됩니다. 업데이트하려면 버전 태그를 바꿔 setup을 다시 실행하세요.
