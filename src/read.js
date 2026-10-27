@@ -122,6 +122,13 @@ export function toApiDay(s) {
   if (!ok) throw new Error(`날짜 '${s}'은(는) 'YYYY-MM-DD' 형식이어야 합니다.`);
   return `${m[1]}${String(mo).padStart(2, "0")}${String(d).padStart(2, "0")}`;
 }
+// YYYYMMDD strings compare as dates; a reversed range would quietly answer for some other period
+function inOrder(first, last) {
+  if (first && last && first > last) {
+    throw new GroupwareError(`시작일(${fmtDate(first)})이 종료일(${fmtDate(last)})보다 늦습니다.`);
+  }
+  return [first, last];
+}
 const pad = (n) => String(n).padStart(2, "0");
 const ymdOf = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;   // local time, like datetime.now()
 // Python's float(): "-", "----", "" and null are the API's empties and read as 0
@@ -217,8 +224,8 @@ export async function collectMailCorrespondence(session, { person, start = null,
   }
   if (!(limit >= 1 && limit <= 50)) throw new GroupwareError("limit은 1~50 사이여야 합니다.");   // a negative limit would open everything
   // normalized, so an unpadded "2026-10-1" still compares as a date
-  const lo = start ? fmtDate(toApiDay(start)) : "";
-  const hi = end ? fmtDate(toApiDay(end)) : "9999-12-31";
+  const [first, last] = inOrder(start ? toApiDay(start) : "", end ? toApiDay(end) : "");
+  const lo = first ? fmtDate(first) : "", hi = last ? fmtDate(last) : "9999-12-31";
   // ponytail: the first search page only (50 rows); older mail with this person can be missed
   const rows = await fetchMailList(session, { box: "ALL", count: 50, query: person }, { fetch });
   const picked = rows.filter((m) => lo <= m.date.slice(0, 10) && m.date.slice(0, 10) <= hi
@@ -256,7 +263,7 @@ export async function fetchBoardPosts(session, { board_id, page = 1, count = 20,
     author: a.mbr_nick || "",
     date: fmtStamp(a.write_date_origin || a.write_date),   // list write_date is date-only
     unread: String(a.art_read_yn) !== "Y",
-    comments: a.comment_cnt ?? null,
+    comments: num(a.comment_cnt),   // the count arrives as a string ("1"), or null for none
     notice: String(a.notice_yn) === "Y",
   }));
 }
@@ -291,13 +298,16 @@ export async function fetchBoardPost(session, { art_seq_no } = {}, { fetch } = {
   if ((data.view_perm_yn != null && data.view_perm_yn !== "Y") || art.art_password || art.del_yn === "Y") {
     throw new GroupwareError("열람 권한이 없거나 비밀번호가 걸린(또는 삭제된) 글입니다.");
   }
+  // comments live in the groupware's shared comment store (the post view's comment box), not in ViewPost
+  const talk = (await request(session, "/gw/api/gw026A03", { moduleGbnCode: "board", moduleSeq: String(art_seq_no),
+    commentType: "", commentSeq: "", sort: "A", searchWay: "D", pageSize: 1000 }, { fetch })) || {};
   return {
     title: art.art_title || "",
     author: art.mbr_nick || "",
     date: fmtStamp(art.write_date),
     body: clean(art.art_content || art.contents_text || art.contents),
-    comments: (data.remarkList || []).map((r) => ({ author: r.mbr_nick || "", date: fmtStamp(r.write_date),
-      text: clean(r.art_remark || r.remark) })),
+    comments: (talk.commentList || []).filter((c) => c.useYn !== "N").map((c) => ({ author: c.empName || "",
+      date: fmtStamp(c.createDate), text: c.commentPassword ? "(비밀 댓글)" : clean(c.contents) })),
   };
 }
 
@@ -333,8 +343,7 @@ const LEAVE_STATUS = { 1: "결재완료", 2: "결재 문서 없음", 5: "임시�
 export async function fetchLeaveRequests(session, { start = null, end = null } = {}, { fetch, now = () => new Date() } = {}) {
   const [coCd, empCd] = erp(session);
   const year = now().getFullYear();
-  const first = start ? toApiDay(start) : `${year}0101`;
-  const last = end ? toApiDay(end) : `${year}1231`;
+  const [first, last] = inOrder(start ? toApiDay(start) : `${year}0101`, end ? toApiDay(end) : `${year}1231`);
   const rows = await request(session, "/human/attendapplication/at00001",
     { employeeList: [{ coCd, empCd }], startDate: first, endDate: last, approState: "", linkKey: "" }, { fetch });
   // allowlist: linkKey and approKey are the HR system's internal keys and stay here
@@ -342,7 +351,10 @@ export async function fetchLeaveRequests(session, { start = null, end = null } =
     type: r.atItemNm || r.atCdNm || "",
     start: fmtDate(r.startDt),
     end: fmtDate(r.endDt),
-    days: num(r.ycUseCnt),
+    days: num(r.ycUseCnt),   // annual leave used: 0 for other leave and trips, however long
+    hours: num(r.appTm) / 60,   // the time applied for, in minutes: what a part day keeps
+    time: /^\d{4}$/.test(r.startTm) && /^\d{4}$/.test(r.endTm)
+      ? `${r.startTm.slice(0, 2)}:${r.startTm.slice(2)}~${r.endTm.slice(0, 2)}:${r.endTm.slice(2)}` : "",
     reason: r.appRmkDc || "",
     status: r.approStateNm || (has(LEAVE_STATUS, String(r.approState)) ? LEAVE_STATUS[String(r.approState)] : r.approState || ""),
     doc_id: r.idDoc ?? null,   // an e-approval document id, for approval_read
@@ -444,42 +456,55 @@ function rowsOf(data, key, path) {
 export async function fetchResources(session, { search = "" } = {}, { fetch } = {}) {
   const data = await request(session, "/schres/rs121A01",
     { companyInfo: companyInfo(session), searchText: search, langCode: "kr" }, { fetch });
-  return rowsOf(data, "resultList", "/schres/rs121A01").map((r) => ({
+  const rows = rowsOf(data, "resultList", "/schres/rs121A01").map((r) => ({
     res_seq: r.resSeq ?? null,
     name: r.resName || "",
     category: r.attrName || "",
     approval_required: String(r.apprYn) === "Y",
   }));
+  // the API takes searchText and ignores it (live 2026-10-27): filter here
+  const needle = String(search).trim().toLowerCase();
+  return needle ? rows.filter((r) => `${r.name} ${r.category}`.toLowerCase().includes(needle)) : rows;
 }
 
 export async function scheduleRows(session, start, end, resSeqs, fetch) {
   const data = await request(session, "/schres/rs121A05",
-    { companyInfo: companyInfo(session), langCode: "kr", startDate: toApiDay(start), endDate: toApiDay(end),
+    { companyInfo: companyInfo(session), langCode: "kr", ...dayRange(start, end),
       resList: resSeqs.map((resSeq) => ({ resSeq })), statusType: ["10", "20"], statusCode: "", sechText: "",
       resUserName: "", menuAuth: "USER" }, { fetch });
   return rowsOf(data, "resultList", "/schres/rs121A05");
 }
 
 export async function fetchResourceSchedule(session, { start, end, res_seqs = null } = {}, { fetch } = {}) {
-  if (res_seqs === null || res_seqs === undefined) {
-    res_seqs = (await fetchResources(session, {}, { fetch })).map((r) => r.res_seq);
-  }
+  dayRange(start, end);   // bad or reversed dates fail before any request
+  const known = (await fetchResources(session, {}, { fetch })).map((r) => r.res_seq);
+  if (res_seqs === null || res_seqs === undefined) res_seqs = known;
+  const unknown = res_seqs.filter((s) => !known.some((k) => String(k) === String(s)));
+  // an unknown id would be left out silently and read as "no bookings"
+  if (unknown.length) throw new GroupwareError(`자원 ${unknown.join(", ")}을(를) 찾을 수 없습니다. resource_list의 res_seq를 넣어 주세요.`);
   return (await scheduleRows(session, start, end, res_seqs, fetch)).map((r) => ({
     res_name: r.resName || "",
     title: r.reqText || "",
     start: fmtStamp(r.resStartDate),
     end: fmtStamp(r.resEndDate),
     booker: r.empName || "",
-    status: r.statusCode ?? null,
+    status: resStatus(r.statusCode),
   }));
 }
 
-const RES_STATUS = { RC: "예약완료" };   // the only code seen live; others pass through as they come
+// the resource module's own labels (/modules/schres); an unknown code passes through as it comes
+const RES_STATUS = { RC: "예약완료", RE: "승인요청", CO: "승인완료", RJ: "반려", CA: "취소", CR: "승인취소", AC: "자동취소" };
+const resStatus = (code) => (has(RES_STATUS, String(code)) ? RES_STATUS[String(code)] : code ?? null);
+// {startDate, endDate} for the resource APIs, in order
+const dayRange = (start, end) => {
+  const [startDate, endDate] = inOrder(toApiDay(start), toApiDay(end));
+  return { startDate, endDate };
+};
 
 export async function fetchMyReservations(session, { start, end } = {}, { fetch } = {}) {
   const data = await request(session, "/schres/rs121A08",
-    { companyInfo: companyInfo(session), menuAuth: "USER", attrSeq: "A", startDate: toApiDay(start),
-      endDate: toApiDay(end), statusCode: "", sechText: "", pageNum: 1, pageSize: 100, myResYn: "Y", langCode: "kr" },
+    { companyInfo: companyInfo(session), menuAuth: "USER", attrSeq: "A", ...dayRange(start, end),
+      statusCode: "", sechText: "", pageNum: 1, pageSize: 100, myResYn: "Y", langCode: "kr" },
     { fetch });
   // ponytail: first 100 only; add paging if one range ever holds more of your own bookings
   return rowsOf(data, "resourceSearchList", "/schres/rs121A08").filter((r) => String(r.statusCode) !== "CA").map((r) => ({
@@ -488,7 +513,7 @@ export async function fetchMyReservations(session, { start, end } = {}, { fetch 
     title: r.reqText || "",
     start: fmtStamp(r.startDate),
     end: fmtStamp(r.endDate),
-    status: has(RES_STATUS, String(r.statusCode)) ? RES_STATUS[String(r.statusCode)] : r.statusCode ?? null,
+    status: resStatus(r.statusCode),
   }));
 }
 
@@ -510,7 +535,7 @@ export async function calendarRows(session, first, last, cals, mineOnly = false,
 }
 
 export async function fetchSchedule(session, { start, end, mine_only = false } = {}, { fetch } = {}) {
-  const first = toApiDay(start), last = toApiDay(end);   // bad dates fail before any request
+  const [first, last] = inOrder(toApiDay(start), toApiDay(end));   // bad or reversed dates fail before any request
   const shown = (await calendars(session, { fetch })).filter((c) => c.displayYn !== "N");
   const rows = await calendarRows(session, first, last, shown, mine_only, { fetch });
   if (rows.length > 200) {   // every calendar over a long range would flood the model's context
@@ -546,8 +571,7 @@ export async function fetchApprovals(session, { box = "submitted", start = null,
   if (!has(APPROVAL_BOXES, box)) throw new GroupwareError(`box는 ${Object.keys(APPROVAL_BOXES).join(", ")} 중 하나여야 합니다.`);
   const [path, pageCode, picker, boxId, menuNo, shape] = APPROVAL_BOXES[box];
   const year = now().getFullYear();
-  const first = start ? toApiDay(start) : `${year}0101`;
-  const last = end ? toApiDay(end) : `${year}1231`;
+  const [first, last] = inOrder(start ? toApiDay(start) : `${year}0101`, end ? toApiDay(end) : `${year}1231`);
   const data = await request(session, path, {
     fDocSts: [], page: String(page), pageSize: String(count), eaBoxId: boxId, nMenuID: menuNo, sfrDt: first,
     stoDt: last, sFormId: ["0"], periodPicker: picker, sortField: picker, sortType: "DESC", docContentsData: {},
@@ -575,15 +599,20 @@ export async function fetchApproval(session, { doc_id, form_id } = {}, { fetch }
   if (Array.isArray(info)) info = info[0] || {};
   const status = String(data.doc_sts || info.doc_sts || "");
   const content = (m.appdoccontent && m.appdoccontent.length ? m.appdoccontent : [{}])[0];
+  const title = info.doc_title || data.doc_title || "", line = data.jsonKyuljaeArr || [];
+  // an unknown id answers success with every field empty; a real document has a title and a line
+  if (!title && !line.length) {
+    throw new GroupwareError(`결재 문서(doc_id ${doc_id}, form_id ${form_id})를 찾을 수 없습니다. approval_list의 doc_id·form_id를 넣어 주세요.`);
+  }
   return {
-    title: info.doc_title || data.doc_title || "",
+    title,
     status: docStatus(status),
     drafter: info.user_nm || data.user_nm || "",
     dept: info.dept_nm || data.dept_nm || "",
     form: info.form_nm || "",
     // live 2026-10-16: work_order was 1 on every step and app_yn "0" even on a finished
     // document, so seq gives the order and no per-step approval flag is claimed
-    approval_line: (data.jsonKyuljaeArr || []).map((s) => ({
+    approval_line: line.map((s) => ({
       order: s.seq ?? null,
       step: s.act_nm || "",
       name: s.user_nm || "",

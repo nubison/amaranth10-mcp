@@ -72,8 +72,8 @@ test("results reach the model the way Python's MCPServer renders them", async ()
   assert.deepEqual(texts(listed), [["text", JSON.stringify(row(1), null, 2)], ["text", JSON.stringify(row(2), null, 2)]]);
   assert.ok(!listed.isError);
   assert.equal(fake.calls[0].body.body.pageSize, "20", "the schema's default reaches the function");
-  // an empty list is no block at all; a dict is one block
-  assert.deepEqual((await client.callTool({ name: "mail_folders", arguments: {} })).content, []);
+  // an empty list says so in one block, "[]", never no content at all; a dict is one block
+  assert.deepEqual(texts(await client.callTool({ name: "mail_folders", arguments: {} })), [["text", "[]"]]);
   const balance = await client.callTool({ name: "leave_balance", arguments: {} });
   assert.equal(balance.content.length, 1);
   assert.equal(JSON.parse(balance.content[0].text).remaining, 12);
@@ -95,6 +95,7 @@ test("stringified arguments are parsed like the Python SDK's pre_parse_json and 
     if (path === "/mail/mail003A01") return { Records: [] };
     if (path.endsWith("sc111A02")) return { resultList: CALS };
     if (path.endsWith("gw102A04")) return [KIM];
+    if (path.endsWith("eap110A03")) return { doc_title: "문서" };
     return {};
   });
   const client = await connect(fake.gw);
@@ -114,6 +115,12 @@ test("stringified arguments are parsed like the Python SDK's pre_parse_json and 
   assert.equal(fake.count("sc111A05"), 0);
   // text that is not JSON is still refused; a str | int keeps its string
   assert.equal((await client.callTool({ name: "alerts", arguments: { count: "many" } })).isError, true);
+  // counts, pages and limits start at 1: a zero or negative one is refused before any request
+  const sent = fake.calls.length;
+  for (const [name, args] of [["alerts", { count: -5 }], ["mail_list", { count: 0 }], ["board_posts", { board_id: 1, page: 0 }]]) {
+    assert.equal((await client.callTool({ name, arguments: args })).isError, true, name);
+  }
+  assert.equal(fake.calls.length, sent);
   assert.equal((await client.callTool({ name: "approval_read", arguments: { doc_id: "123", form_id: 7 } })).isError, undefined);
   assert.deepEqual([fake.calls.at(-1).body.docID, fake.calls.at(-1).body.formID], ["123", "7"]);
 });

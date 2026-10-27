@@ -31,7 +31,7 @@ const lax = (t) => z.preprocess((v) => {
 
 // Python's annotations: str | int, X | None = None, and defaults filled in before the call
 const strOrInt = z.union([z.string(), z.number().int()]);
-const int = (d) => lax(z.number().int().default(d));
+const int = (d) => lax(z.number().int().min(1).default(d));   // every count, page and limit starts at 1
 const str = (d) => z.string().default(d);
 const flag = lax(z.boolean().default(false));
 const orNone = (t) => t.nullable().default(null);
@@ -82,10 +82,12 @@ const TOOLS = [
     + "board_id를 생략하면 모든 게시판에서 찾아 최신순으로 합친다. board는 게시판 이름."],
   ["board_read", OPENS, read.fetchBoardPost, { art_seq_no: strOrInt },
     "게시글 본문과 댓글. 열 때마다 조회수가 1 오른다. comments는 댓글 목록(작성자·날짜·내용)."],
-  ["resource_list", READ_ONLY, read.fetchResources, { search: str("") }, "예약 가능한 자원(회의실 등) 검색."],
+  ["resource_list", READ_ONLY, read.fetchResources, { search: str("") },
+    "예약 가능한 자원(회의실 등) 목록. search를 주면 이름이나 종류(category)에 그 글자가 든 것만."],
   ["resource_schedule", READ_ONLY, read.fetchResourceSchedule,
     { start: z.string(), end: z.string(), res_seqs: listOrNone(z.any()) },
-    "기간의 자원 예약 현황. start/end는 'YYYY-MM-DD'(하루 단위, 양 끝 포함).\nres_seqs를 생략하면 전체 자원."],
+    "기간의 자원 예약 현황. start/end는 'YYYY-MM-DD'(하루 단위, 양 끝 포함).\n"
+    + "res_seqs를 생략하면 전체 자원. status는 예약완료·승인요청·승인완료·반려 등."],
   ["resource_my_reservations", READ_ONLY, read.fetchMyReservations, { start: z.string(), end: z.string() },
     "내 자원 예약 목록(취소된 건 제외). start/end는 'YYYY-MM-DD'.\nres_seq·start·end는 resource_cancel에 그대로 쓴다."],
   ["resource_reserve", WRITES, write.reserveResource,
@@ -136,7 +138,8 @@ const TOOLS = [
     "전자결재 문서 상세: 결재선과 본문 텍스트. 미결 문서를 열면 기안자에게 열람으로 보일 수 있다."],
   ["leave_balance", READ_ONLY, read.fetchLeaveBalance, {}, "연차 잔여(일반·보상·대체)."],
   ["leave_requests", READ_ONLY, read.fetchLeaveRequests, { start: orNone(z.string()), end: orNone(z.string()) },
-    "내 휴가 신청 목록: 종류(type)·기간·일수(days)·사유·결재 상태(status)·취소 여부(canceled). "
+    "내 휴가 신청 목록: 종류(type)·기간·연차 사용 일수(days)·신청 시간(hours)·시각(time)·사유·결재 상태(status)·"
+    + "취소 여부(canceled). days는 연차에서 빠지는 일수라 기타휴가·출장은 0이고, 반차·시간 단위 신청은 hours와 time으로 본다. "
     + "출장 등 다른 근태 신청도 함께 오며 type으로 구분한다.\n"
     + "start/end는 'YYYY-MM-DD', 생략하면 올해. doc_id는 전자결재 문서 ID라서, approval_list에서\n"
     + "같은 doc_id의 form_id를 찾아 approval_read로 연다. 남은 연차는 leave_balance."],
@@ -152,7 +155,9 @@ export function createServer({ gw = new Groupware() } = {}) {
   for (const [name, annotations, fn, inputSchema, description] of TOOLS) {
     server.registerTool(name, { description, inputSchema, annotations }, async (args) => {
       try {
-        return { content: toContent(await gw.call((session, fetch) => fn(session, args, { fetch }))) };
+        const out = await gw.call((session, fetch) => fn(session, args, { fetch }));
+        // an empty list says so: no content at all reads as a failure or a missing answer
+        return { content: Array.isArray(out) && !out.length ? [{ type: "text", text: "[]" }] : toContent(out) };
       } catch (e) {   // Groupware.call hands back a GroupwareError with Korean text
         return { isError: true, content: [{ type: "text", text: e.message }] };
       }

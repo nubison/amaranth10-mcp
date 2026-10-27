@@ -179,7 +179,7 @@ for (const unit of ["<style", "<", "<a ", " ", "&", "<!--", "&#"]) {
 test("fetchBoardPosts fields and unread", async () => {
   const { fetch, calls } = fake(() => ({ articleList: [
     { art_seq_no: "100", art_title: "공지", mbr_nick: "관리자", write_date: "2026-10-15",
-      write_date_origin: "2026-10-15 09:00:21", art_read_yn: "N", comment_cnt: 3, notice_yn: "Y" }] }));
+      write_date_origin: "2026-10-15 09:00:21", art_read_yn: "N", comment_cnt: "3", notice_yn: "Y" }] }));   // a string, as live
   const out = await fetchBoardPosts(SESSION, { board_id: 42 }, { fetch });
   assert.equal(calls[0].path, "/board/APIHandler/ViewBoardArtList");
   assert.deepEqual(calls[0].body, { boardNo: "42", page: 1, pageSize: "20", sort: "write_date",
@@ -194,18 +194,31 @@ test("fetchBoardPosts puts the query in the field's own key", async () => {
   assert.equal(calls[0].body.searchDesc, "q");
 });
 
-test("fetchBoardPost body and comments", async () => {
-  const { fetch, calls } = fake(() => ({
-    art: { art_title: "제목", mbr_nick: "글쓴이", write_date: "202610151000", art_content: "<p>본문&amp;</p>" },
-    remarkList: [{ mbr_nick: "댓쓴이", write_date: "202610151100", art_remark: "댓글" }],
-  }));
-  const out = await fetchBoardPost(SESSION, { art_seq_no: "100" }, { fetch });
+test("fetchBoardPost body, and comments from the shared comment store", async () => {
+  const { fetch, calls } = fake((path) => (path === "/gw/api/gw026A03" ? { commentList: [
+    { empName: "댓쓴이", createDate: "2026-10-26 12:44:16", contents: "Zoom 링크 https://zoom.example/j/1", useYn: "Y" },
+    { empName: "지운이", createDate: "2026-10-26 13:00:00", contents: "지운 댓글", useYn: "N" },
+    { empName: "숨긴이", createDate: "2026-10-26 14:00:00", contents: "비밀 내용", useYn: "Y", commentPassword: "x" }] }
+    : { art: { art_title: "제목", mbr_nick: "글쓴이", write_date: "202610151000", art_content: "<p>본문&amp;</p>" },
+      remarkList: [] }));   // ViewPost's remarkList stays empty even on a post with comments (live)
+  const out = await fetchBoardPost(SESSION, { art_seq_no: 100 }, { fetch });
   assert.equal(calls[0].path, "/board/APIHandler/ViewPost");
   assert.deepEqual(calls[0].body, { art_seq_no: "100", adminPage: "N", externalYn: "N",
     menuCode: "UFA", pageCode: "UFA1000", moduleCode: "UF", presentPassword: "", isPrint: "N",
     searchParams: null });
+  assert.deepEqual(calls[1], { path: "/gw/api/gw026A03", body: { moduleGbnCode: "board", moduleSeq: "100", commentType: "",
+    commentSeq: "", sort: "A", searchWay: "D", pageSize: 1000 }, init: calls[1].init });
   assert.equal(out.body, "본문&");
-  assert.deepEqual(out.comments[0], { author: "댓쓴이", date: "2026-10-15 11:00", text: "댓글" });
+  // a deleted comment is left out, a password one keeps its place but not its text
+  assert.deepEqual(out.comments, [
+    { author: "댓쓴이", date: "2026-10-26 12:44", text: "Zoom 링크 https://zoom.example/j/1" },
+    { author: "숨긴이", date: "2026-10-26 14:00", text: "(비밀 댓글)" }]);
+});
+
+test("fetchBoardPost asks for no comments on a post it refuses", async () => {
+  const { fetch, calls } = fake(() => ({ view_perm_yn: "N", art: { art_title: "제목" } }));
+  await assert.rejects(fetchBoardPost(SESSION, { art_seq_no: "100" }, { fetch }), GroupwareError);
+  assert.deepEqual(calls.map((c) => c.path), ["/board/APIHandler/ViewPost"]);
 });
 
 for (const [name, perm, extra] of [["no permission", "N", {}], ["password", "Y", { art_password: "1234" }],
@@ -386,7 +399,7 @@ test("sparse rows keep their keys as null, like python's None", async () => {
   assert.equal((await fetchAlerts(SESSION, {}, { fetch }))[0].id, null);
   assert.equal((await fetchMailList(SESSION, { box: "ALL" }, { fetch }))[0].muid, null);
   const p = (await fetchBoardPosts(SESSION, { board_id: 1 }, { fetch }))[0];
-  assert.deepEqual([p.art_seq_no, p.comments], [null, null]);
+  assert.deepEqual([p.art_seq_no, p.comments], [null, 0]);   // no count is no comments
   assert.equal((await fetchBoardList(SESSION, {}, { fetch }))[0].level, null);
 });
 

@@ -80,11 +80,12 @@ for (const [id, user] of NO_ERP) {
 }
 
 // ---- leave requests
+// live shape: appTm is the time applied for in minutes, startTm/endTm "HHMM"
 const LEAVE_ROW = { appSq: 31, atItemNm: "연차", atCdNm: "연차(종일)", startDt: "20260923", endDt: "20260923",
-  appTm: "0900~1300", ycUseCnt: 0.5, appRmkDc: "추석 전날 오전근무", approStateNm: null, approState: "1",
-  idDoc: "1002770", reportCancYn: "N", linkKey: "LINK-SECRET", approKey: "APPRO-SECRET" };
-const leaveOut = { type: "연차", start: "2026-09-23", end: "2026-09-23", days: 0.5, reason: "추석 전날 오전근무",
-  status: "결재완료", doc_id: "1002770", canceled: false };
+  appTm: 240, startTm: "0900", endTm: "1300", ycUseCnt: 0.5, appRmkDc: "추석 전날 오전근무", approStateNm: null,
+  approState: "1", idDoc: "1002770", reportCancYn: "N", linkKey: "LINK-SECRET", approKey: "APPRO-SECRET" };
+const leaveOut = { type: "연차", start: "2026-09-23", end: "2026-09-23", days: 0.5, hours: 4, time: "09:00~13:00",
+  reason: "추석 전날 오전근무", status: "결재완료", doc_id: "1002770", canceled: false };
 
 test("fetchLeaveRequests request and fields", async () => {
   const noState = { ...LEAVE_ROW }; delete noState.approState;
@@ -105,6 +106,15 @@ test("fetchLeaveRequests request and fields", async () => {
     { ...leaveOut, status: "임시보관" },
     { ...leaveOut, status: "" }]);
   assert.ok(!JSON.stringify(out).includes("SECRET"));   // linkKey and approKey stay inside
+});
+
+test("fetchLeaveRequests keeps a part day that uses no annual leave", async () => {
+  // live 2026-09-23: 기타휴가 13:00~18:00, appTm 300 minutes, ycUseCnt 0
+  const row = { ...LEAVE_ROW, atItemNm: null, atCdNm: "기타휴가", appTm: 300, startTm: "1300", endTm: "1800", ycUseCnt: 0 };
+  const [out] = await fetchLeaveRequests(HR, {}, { fetch: fake(() => [row]).fetch });
+  assert.deepEqual([out.type, out.days, out.hours, out.time], ["기타휴가", 0, 5, "13:00~18:00"]);
+  const [bare] = await fetchLeaveRequests(HR, {}, { fetch: fake(() => [{ ...row, appTm: null, startTm: null }]).fetch });
+  assert.deepEqual([bare.hours, bare.time], [0, ""]);
 });
 
 test("fetchLeaveRequests defaults to this year", async () => {
@@ -216,26 +226,62 @@ const resFake = (calls) => fake((path) => path === "/schres/rs121A01"
 
 test("fetchResources request and fields", async () => {
   const { fetch, calls } = resFake();
-  const out = await fetchResources(RES, { search: "회의" }, { fetch });
+  const out = await fetchResources(RES, {}, { fetch });
   assert.deepEqual(calls[0], { path: "/schres/rs121A01", body: {
     companyInfo: { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", emailAddr: "", emailDomain: "" },
-    searchText: "회의", langCode: "kr" } });
+    searchText: "", langCode: "kr" } });
   assert.deepEqual(out, [{ res_seq: "7", name: "회의실 A", category: "회의실", approval_required: false },
     { res_seq: "8", name: "투싼", category: "차량", approval_required: true }]);
 });
 
+test("fetchResources search filters by name or category, since the API ignores it", async () => {
+  const names = async (search) => (await fetchResources(RES, { search }, { fetch: resFake().fetch })).map((r) => r.name);
+  assert.deepEqual(await names("투싼"), ["투싼"]);
+  assert.deepEqual(await names(" 차량 "), ["투싼"]);
+  assert.deepEqual(await names("회의"), ["회의실 A"]);
+  assert.deepEqual(await names("없는것"), []);
+});
+
 test("fetchResourceSchedule request and fields", async () => {
   const { fetch, calls, paths } = resFake();
-  const out = await fetchResourceSchedule(RES, { start: "2099-01-01", end: "2099-01-02", res_seqs: ["7"] }, { fetch });
-  assert.deepEqual(paths(), ["/schres/rs121A05"]);   // no resource lookup when seqs given
-  const b = calls[0].body;
+  const out = await fetchResourceSchedule(RES, { start: "2099-01-01", end: "2099-01-02", res_seqs: [7] }, { fetch });
+  assert.deepEqual(paths(), ["/schres/rs121A01", "/schres/rs121A05"]);   // the ids are checked against the list
+  const b = calls[1].body;
   assert.deepEqual([b.startDate, b.endDate], ["20990101", "20990102"]);
-  assert.deepEqual(b.resList, [{ resSeq: "7" }]);
+  assert.deepEqual(b.resList, [{ resSeq: 7 }]);
   assert.deepEqual(b.statusType, ["10", "20"]);
   assert.equal(b.menuAuth, "USER");
   assert.deepEqual(out, [
     { res_name: "회의실 A", title: "주간 회의", start: "2099-10-01 14:00", end: "2099-10-01 15:00", booker: "김", status: "20" },
     { res_name: "회의실 B", title: "면접", start: "2099-10-02 10:00", end: "2099-10-02 11:30", booker: "이", status: "10" }]);
+});
+
+test("fetchResourceSchedule refuses an unknown resource id instead of answering no bookings", async () => {
+  const { fetch, paths } = resFake();
+  await assert.rejects(fetchResourceSchedule(RES, { start: "2099-01-01", end: "2099-01-01", res_seqs: ["7", "999"] },
+    { fetch }), (e) => e instanceof GroupwareError && /999/.test(e.message) && !/7,/.test(e.message));
+  assert.deepEqual(paths(), ["/schres/rs121A01"]);
+});
+
+test("reservation status codes read as the resource screen names them", async () => {
+  const codes = ["RC", "RE", "CO", "RJ", "CR", "AC", "ZZ"];
+  const { fetch } = fake((path) => path === "/schres/rs121A01" ? { resultList: [{ resSeq: "7" }] }
+    : { resultList: codes.map((statusCode) => ({ resStartDate: "209901011000", resEndDate: "209901011100", statusCode })) });
+  const out = await fetchResourceSchedule(RES, { start: "2099-01-01", end: "2099-01-01" }, { fetch });
+  assert.deepEqual(out.map((r) => r.status), ["예약완료", "승인요청", "승인완료", "반려", "승인취소", "자동취소", "ZZ"]);
+});
+
+test("a range whose start is after its end is refused before any request", async () => {
+  const calls = [];
+  const { fetch } = fake(() => ({}), calls);
+  const late = { start: "2026-10-31", end: "2026-10-01" };
+  for (const call of [fetchSchedule(RES, late, { fetch }), fetchResourceSchedule(RES, late, { fetch }),
+    fetchMyReservations(RES, late, { fetch }), fetchLeaveRequests(HR, late, { fetch }), fetchApprovals(RES, late, { fetch })]) {
+    await assert.rejects(call, (e) => e instanceof GroupwareError && e.message === "시작일(2026-10-31)이 종료일(2026-10-01)보다 늦습니다.");
+  }
+  assert.deepEqual(calls, []);
+  assert.equal((await fetchSchedule(RES, { start: "2099-01-01", end: "2099-01-01" },
+    { fetch: fake((p) => (p.endsWith("sc111A02") ? { resultList: [] } : {})).fetch })).length, 0);   // one day is fine
 });
 
 test("fetchResourceSchedule defaults to all resources", async () => {
@@ -361,12 +407,20 @@ for (const asList of [true, false]) {
 }
 
 test("fetchApproval body falls back to the stored contents", async () => {
-  const { fetch } = fake(() => ({ doc_sts: "20", html: "<p>_DF11_</p>", resultMap: { appdoccontent: [
+  const { fetch } = fake(() => ({ doc_sts: "20", html: "<p>_DF11_</p>", resultMap: { appdocinfo: { doc_title: "출장" }, appdoccontent: [
     { doc_id: "7", contents_tp: "10", doc_contents: "<body><p>출장 목적: 고객 미팅</p></body>" }] } }));
   const out = await fetchApproval(RES, { doc_id: 7, form_id: 2040 }, { fetch });
   assert.deepEqual([out.status, out.body], ["상신", "출장 목적: 고객 미팅"]);
-  const empty = await fetchApproval(RES, { doc_id: 7, form_id: 2040 }, { fetch: fake(() => ({ resultMap: { appdoccontent: [] } })).fetch });
-  assert.equal(empty.body, "");
+  const bare = { doc_title: "출장", jsonKyuljaeArr: [], resultMap: { appdoccontent: [] } };
+  assert.equal((await fetchApproval(RES, { doc_id: 7, form_id: 2040 }, { fetch: fake(() => bare).fetch })).body, "");
+});
+
+test("fetchApproval reports an unknown document instead of an empty one", async () => {
+  // live: doc_id 1 / form_id 1 answers success with every field empty
+  for (const reply of [{}, { resultMap: { appdocinfo: [], appdoccontent: [] }, jsonKyuljaeArr: [] }]) {
+    await assert.rejects(fetchApproval(RES, { doc_id: 1, form_id: 1 }, { fetch: fake(() => reply).fetch }),
+      (e) => e instanceof GroupwareError && /결재 문서\(doc_id 1, form_id 1\)를 찾을 수 없습니다/.test(e.message));
+  }
 });
 
 // ---- listings fail closed: Python's `(data or {}).get(key) or []` raises on anything but a dict
@@ -375,7 +429,8 @@ const unexpected = (e) => e instanceof GroupwareError && /unexpected response/.t
 const RANGE = { start: "2099-01-01", end: "2099-01-01" };
 const listings = (answer) => [
   fetchResources(RES, {}, { fetch: fake(answer).fetch }),
-  fetchResourceSchedule(RES, { ...RANGE, res_seqs: ["7"] }, { fetch: fake(answer).fetch }),
+  fetchResourceSchedule(RES, { ...RANGE, res_seqs: ["7"] },
+    { fetch: fake((p) => (p === "/schres/rs121A01" ? { resultList: [{ resSeq: "7" }] } : answer())).fetch }),
   fetchMyReservations(RES, RANGE, { fetch: fake(answer).fetch }),
   fetchSchedule(RES, RANGE, { fetch: fake(answer).fetch }),   // the calendar list
   fetchSchedule(RES, RANGE, { fetch: fake((p) => (p.endsWith("sc111A02") ? { resultList: CALS } : answer())).fetch }),   // the rows
