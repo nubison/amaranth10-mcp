@@ -1,0 +1,61 @@
+{
+  "manifest_version": "0.4",
+  "name": "amaranth10-mcp",
+  "display_name": "Amaranth10",
+  "version": "0.7.0",
+  "description": "더존 아마란스10 그룹웨어의 메일·게시판·알림·일정·전자결재·조직도·연차·휴가를 조회하고, 자원 예약·취소와 개인 일정 등록·수정·삭제를 한다",
+  "author": {
+    "name": "nubison",
+    "url": "https://github.com/nubison"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "bin/amaranth10-mcp.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/bin/amaranth10-mcp.js"
+      ],
+      "env": {
+        "AMARANTH_URL": "${user_config.url}",
+        "AMARANTH_ID": "${user_config.id}",
+        "AMARANTH_PASSWORD": "${user_config.password}"
+      }
+    }
+  },
+  "user_config": {
+    "url": {
+      "type": "string",
+      "title": "그룹웨어 주소",
+      "description": "예: https://gw.example.com",
+      "required": true
+    },
+    "id": {
+      "type": "string",
+      "title": "아이디",
+      "description": "그룹웨어 로그인 아이디",
+      "required": true
+    },
+    "password": {
+      "type": "string",
+      "title": "비밀번호",
+      "description": "그룹웨어 비밀번호. Claude Desktop이 안전하게 보관한다",
+      "sensitive": true,
+      "required": true
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ],
+    "runtimes": {
+      "node": ">=20"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nubison/amaranth10-mcp"
+  },
+  "homepage": "https://github.com/nubison/amaranth10-mcp",
+  "license": "MIT"
+}

@@ -1,0 +1,10 @@
+test/
+docs/
+.superpowers/
+.DS_Store
+.gitignore
+.mcpbignore
+package-lock.json
+*.tgz
+*.mcpb
+.github/
