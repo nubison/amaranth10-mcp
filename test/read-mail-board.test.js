@@ -52,7 +52,7 @@ test("fetchAlerts sends the cookies and the user's seqs", async () => {
 // counts arrive as strings, as they do live
 const FOLDERS = [{ mboxSeq: 2089, name: "INBOX", unseen: "1", exists: "34" },
   { mboxSeq: 2092, name: "SENT", unseen: "0", exists: "9" }];
-const MAIL_ROW = { muid: 9, subject: "회의", fromAddrName: "김", seen: 0,
+const MAIL_ROW = { muid: 9, boxName: "INBOX", subject: "회의", fromAddrName: "김", seen: 0,
   tooltipDate: "2026-10-15 12:30:09", rfc822date: "10-15 12:30", attach: true };
 const mailFake = (rows = [MAIL_ROW]) => fake((path) =>
   path === "/mail/mail000A01" ? { mailboxList: FOLDERS } : { Records: rows });
@@ -64,7 +64,7 @@ test("fetchMailList ALL uses the allbox list", async () => {
   const b = calls[0].body;
   assert.deepEqual([b.boxName, b.mboxSeq, b.mainApiCode], ["ALLBOX", "0", "mail003A02"]);
   assert.deepEqual([b.page, b.pageSize, b.seen], [1, 20, false]);
-  assert.deepEqual(out, [{ muid: 9, from: "김", subject: "회의", date: "2026-10-15 12:30",
+  assert.deepEqual(out, [{ muid: 9, box: "INBOX", from: "김", subject: "회의", date: "2026-10-15 12:30",
     unread: true, has_attachment: true }]);
 });
 
@@ -299,7 +299,7 @@ test("mailCorrespondence opens only read mail and keeps mail naming the person",
     ["ALLBOX", "0", "mail003A03", "최하늘", "all", 1, 50]);
   assert.deepEqual(opened, [1, 3, 4]);   // 2 is unread: never opened, so never marked read
   assert.deepEqual(ids(out), [4, 1]);   // 3 does not name the person; oldest first
-  assert.deepEqual(out[0], { muid: 4, from: "홍길동", subject: "메일 4", date: "2026-10-01 08:00",
+  assert.deepEqual(out[0], { muid: 4, box: "", from: "홍길동", subject: "메일 4", date: "2026-10-01 08:00",
     unread: false, has_attachment: false });
 });
 

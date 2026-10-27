@@ -1,4 +1,4 @@
-// The MCP server: 24 tools with their names, descriptions, annotations and parameters, each one
+// The MCP server: 27 tools with their names, descriptions, annotations and parameters, each one
 // call through a shared Groupware. stdout carries MCP only.
 import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -15,6 +15,7 @@ const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
 // opening marks the mail read / bumps the post's view count: a change, but nothing is lost
 const OPENS = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
 const WRITES = { readOnlyHint: false, openWorldHint: false };
+const SENDS = { readOnlyHint: false, openWorldHint: true };   // it leaves the groupware, to anyone, for good
 
 // Python's MCPServer json-parses a string sent for a non-str parameter (Claude Desktop sends lists
 // as JSON text) and pydantic's lax mode takes "10" for an int: so for the int, bool and list
@@ -44,7 +45,7 @@ const TOOLS = [
       flagged_only: flag, with_attachments: flag, to_me_only: flag },
     "메일 목록. box는 'ALL'(전체) 또는 메일함 이름(INBOX·SENT 등, mail_folders 참고).\n"
     + "query를 주면 그 메일함 안에서 검색한다. 필터: unread_only(안 읽음), flagged_only(중요),\n"
-    + "with_attachments(첨부), to_me_only(나에게 온 메일). page는 1부터."],
+    + "with_attachments(첨부), to_me_only(나에게 온 메일). page는 1부터. 각 메일의 box는 mail_mark·mail_delete에 쓴다."],
   ["mail_folders", READ_ONLY, read.fetchMailFolders, {},
     "메일함 목록: 이름, 안 읽은 수(unread), 전체 수(total). 이름은 mail_list의 box에 쓴다."],
   ["mail_read", OPENS, read.fetchMail, { muid: strOrInt },
@@ -55,6 +56,23 @@ const TOOLS = [
     + "전체 메일 검색 첫 페이지(50건)에서 후보를 고르고, 메일을 열어 보낸이·받는이·참조에 person이 있는 것만 돌려준다.\n"
     + "기본은 이미 읽은 메일만 연다. include_unread=true면 안 읽은 메일도 열고, 연 메일은 읽음으로 바뀐다.\n"
     + "start/end는 'YYYY-MM-DD'. limit은 여는 최대 건수(1~50). 본문은 mail_read로 본다."],
+  ["mail_send", SENDS, write.sendMail,
+    { to: lax(z.array(z.string())), cc: listOrNone(z.string()), bcc: listOrNone(z.string()), subject: z.string(),
+      body: str(""), confirm: flag },
+    "메일 보내기. 사용자가 미리보기를 보고 명시적으로 승인한 뒤에만 confirm=true로 호출할 것.\n"
+    + "confirm=false(기본)는 보내지 않고 미리보기(보내는 사람·받는 사람·제목·본문)만 돌려준다.\n"
+    + "to·cc·bcc는 메일 주소 목록('a@b.com' 또는 '이름 <a@b.com>'). 주소를 모르면 사용자에게 물어볼 것. "
+    + "body는 일반 텍스트(줄바꿈 유지). 첨부·답장·전달은 지원하지 않는다. 보낸 메일은 되돌릴 수 없다.\n"
+    + "left_out이 있으면 외부 발송 제한으로 빠진 주소다. "
+    + "결과를 확인하지 못했다는 오류가 나면 다시 호출하지 말고, 사용자에게 보낸메일함에서 확인해 달라고 할 것."],
+  ["mail_delete", WRITES, write.deleteMail, { muids: lax(z.array(strOrInt)), box: str("INBOX"), confirm: flag },
+    "메일을 휴지통으로 옮긴다(그룹웨어 휴지통에서 복구할 수 있다). "
+    + "사용자가 미리보기를 보고 명시적으로 승인한 뒤에만 confirm=true로 호출할 것.\n"
+    + "confirm=false(기본)는 옮기지 않고 미리보기만 돌려준다. 승인받기 전에 지울 메일의 제목을 사용자에게 보여 줄 것.\n"
+    + "muids는 mail_list의 muid 목록(1~50개), box는 그 메일들의 box(한 번에 한 메일함). 휴지통·스팸함 메일은 지우지 않는다."],
+  ["mail_mark", OPENS, write.markMail, { muids: lax(z.array(strOrInt)), box: str("INBOX"), read: flag },
+    "메일을 안 읽음으로 표시한다. read=true면 읽음으로 표시한다.\n"
+    + "muids는 mail_list의 muid 목록(1~50개), box는 그 메일들의 box(한 번에 한 메일함)."],
   ["board_list", READ_ONLY, read.fetchBoardList, {}, "게시판 목록과 board_id."],
   ["board_posts", READ_ONLY, read.fetchBoardPosts, { board_id: strOrInt, page: int(1), count: int(20) },
     "게시판의 글 목록. 새 글은 날짜와 unread로 판단한다. comments는 댓글 수(숫자)."],

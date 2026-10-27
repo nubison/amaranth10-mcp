@@ -1,10 +1,11 @@
-// reserve, cancel and the schedule writes: previews write nothing, one write with the stored ids,
+// reserve, cancel, the schedule and mail writes: previews write nothing, one write with the stored ids,
 // fail-closed guards, and read-backs that never repeat a write
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { GroupwareError, SessionError } from "../src/client.js";
-import { cancelReservation, createSchedule, deleteSchedule, reserveResource, updateSchedule } from "../src/write.js";
+import { cancelReservation, createSchedule, deleteMail, deleteSchedule, markMail, reserveResource, sendMail,
+  updateSchedule } from "../src/write.js";
 
 const RES = { base: "https://gw.example.com", token: "G1|E1|R1", signKey: "test-sign-key",
   user: { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", empSeq: "E1" } };
@@ -14,7 +15,8 @@ const COMPANY = { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", emailAddr: "",
 function fake(handler) {
   const calls = [];
   const fetch = async (url, init) => {
-    const path = new URL(url).pathname, body = JSON.parse(init.body);
+    const path = new URL(url).pathname;
+    const body = init.body instanceof FormData ? Object.fromEntries(init.body) : JSON.parse(init.body);
     calls.push({ path, body });
     const out = handler(path, body, calls);
     return out instanceof Response ? out : new Response(JSON.stringify({ resultCode: 0, resultData: out ?? null }));
@@ -738,3 +740,143 @@ for (const [id, garbage] of [["bare-list", [CANCEL_ROW]], ["true", true], ["stri
     assert.equal(count(api, "rs121A11"), 1);
   });
 }
+
+// ---- mail
+const MAILER = { ...RES, user: { ...RES.user, email: "hong@example.com" } };
+const SETUP = { email: "hong@example.com", mail_from: ["hong@example.com"], userInfo: {},
+  userFromNameList: [{ userName: "다른이름", isDefault: false }, { userName: "홍길동", isDefault: true }],
+  filedir: "/data/f1", sessionKey: "SK-1", bigFileDay: "30", externalSendLimit: "N", "insideDomainArray[]": ["example.com"],
+  groupMailOption: { groupMailAddr: "", groupMailIntedAddr: "", groupMailOrg: "" }, representInfo: [], sharedList: [],
+  useLimit: 0, recvSendRestiction: 0, mailboxPercent: "3", capacityLimit: "0" };
+const reply = (resultCode, resultMsg = "") => new Response(JSON.stringify({ resultCode, resultMsg, resultData: {} }));
+const FOLDER_LIST = { mailboxList: [{ mboxSeq: 2089, name: "INBOX" }, { mboxSeq: 2095, name: "TRASH" }] };
+
+function mailApi({ setup = SETUP, send = () => reply(0), write = () => ({}) } = {}) {
+  return fake((path) => {
+    if (path.endsWith("mail014A01")) return setup;
+    if (path.endsWith("mail014A04")) return send();
+    if (path.endsWith("mail000A01")) return FOLDER_LIST;
+    return write();
+  });
+}
+const sendTo = (api, args = {}, opts = {}) => sendMail(MAILER, { to: ["a@example.com", "김민수 <kim@example.com>"],
+  subject: " 보고 ", body: "안녕\n<b>하세요</b>", ...args }, { fetch: api.fetch, now: () => new Date(2026, 9, 27, 15), ...opts });
+
+test("send: a preview shows the mail and sends nothing", async () => {
+  const api = mailApi();
+  for (const confirm of [false, ...NOT_TRUE]) {
+    assert.deepEqual(await sendTo(api, { confirm }), { from: "홍길동 <hong@example.com>",
+      to: ["a@example.com", "김민수 <kim@example.com>"], cc: [], bcc: [], subject: "보고", body: "안녕\n<b>하세요</b>" });
+  }
+  assert.equal(count(api, "mail014A04"), 0);
+});
+
+test("send: confirm posts the compose form once, as the web client fills it", async () => {
+  const api = mailApi();
+  assert.equal((await sendTo(api, { cc: ["lee@example.com"], confirm: true })).sent, true);
+  assert.equal(count(api, "mail014A04"), 1);
+  assert.deepEqual(bodyOf(api, "mail014A01"), { mailKind: "plain", mailTo: "", uid: "", mbox: "", viewFlag: "noRead",
+    fromFlag: false, readType: "", domainSeq: "" });
+  const form = bodyOf(api, "mail014A04");
+  assert.deepEqual(Object.keys(form), ["from", "fromName", "to", "cc", "bcc", "htmlContents", "email", "fileDir", "bigFile",
+    "bigFileDay", "bigFileCnt", "bigFilePeriod", "mail_kind", "uidAuthList", "fwFile", "urlList", "fileNameList",
+    "receipt_notific", "securitymailuse", "securitymailpass_enc_web", "immediately", "toBeDeleted", "expirationDate",
+    "importantmailuse", "eachTrans", "neobizaddr", "neobizIntedAddr", "neobizOrg", "muid", "domainSeq", "mimeHeader",
+    "sessionKey", "externalSendLimit", "insideDomainArray", "aiResultJSON", "subject", "authToken"]);
+  assert.deepEqual([form.from, form.fromName, form.to, form.cc, form.bcc],
+    ["hong@example.com", "홍길동", "a@example.com,김민수<kim@example.com>", "lee@example.com", ""]);
+  assert.equal(form.htmlContents, "안녕<br>&lt;b&gt;하세요&lt;/b&gt;");
+  assert.deepEqual([form.subject, form.mail_kind, form.fileDir, form.sessionKey, form.insideDomainArray],
+    ["보고", "plain", "/data/f1", "SK-1", '["example.com"]']);
+  assert.deepEqual([form.bigFilePeriod, form.expirationDate], ["2026-10-27 ~ 2026-11-26", "2026-10-27 00:00"]);
+  assert.equal(form.authToken, "hong@example.com|G1|E1|R1");
+});
+
+test("send: cc and bcc skip an address already in to or cc", async () => {
+  const api = mailApi();
+  const out = await sendTo(api, { to: ["a@example.com"], cc: ["A@example.com", "b@example.com"],
+    bcc: ["b@example.com", "c@example.com"] });
+  assert.deepEqual([out.cc, out.bcc], [["b@example.com"], ["c@example.com"]]);
+});
+
+test("send: the user's sender, receipt and each-recipient settings are kept", async () => {
+  const setup = { ...SETUP, mail_from: ["hong@example.com", "team@example.com"], representInfo: ["team@example.com"],
+    userInfo: { defaultuser: "team@example.com", receiveconfirm: "0", eachtrans: "0" } };
+  const api = mailApi({ setup });
+  assert.equal((await sendTo(api)).from, "team@example.com");   // a representative address has no own name
+  await sendTo(api, { confirm: true });
+  const form = bodyOf(api, "mail014A04");
+  assert.deepEqual([form.from, form.fromName, form.receipt_notific, form.eachTrans], ["team@example.com", "", "1", "1"]);
+});
+
+test("send: bad addresses, no recipient or no subject stop before the network", async () => {
+  for (const args of [{ to: ["kim"] }, { to: ["a@example.com, b@example.com"] }, { to: [] }, { cc: ["x@y"] },
+    { subject: "  " }]) {
+    const api = mailApi();
+    await assert.rejects(sendTo(api, { ...args, confirm: true }), GroupwareError);
+    assert.equal(api.calls.length, 0);
+  }
+});
+
+test("send: an account without a sender or with sending limited is refused before the send", async () => {
+  for (const setup of [{ ...SETUP, email: "" }, { ...SETUP, mail_from: [] }, { ...SETUP, useLimit: 1 },
+    { ...SETUP, recvSendRestiction: "3" }, { ...SETUP, mailboxPercent: "120", capacityLimit: "1" }]) {
+    const api = mailApi({ setup });
+    await assert.rejects(sendTo(api, { confirm: true }), GroupwareError);
+    assert.equal(count(api, "mail014A04"), 0);
+  }
+});
+
+test("send: resultCode 1 is sent, with the addresses the external limit left out", async () => {
+  const out = await sendTo(mailApi({ send: () => reply(1, "x@other.com") }), { confirm: true });
+  assert.deepEqual([out.sent, out.left_out], [true, "x@other.com"]);
+});
+
+test("send: an unclear send is reported, never retried", async () => {
+  for (const send of [() => reply(-2, "발송 실패"), timesOut, () => reply(999)]) {
+    const api = mailApi({ send });
+    await assert.rejects(sendTo(api, { confirm: true }), rejectsWith(/확인하지 못했습니다|확인해 주세요/));
+    assert.equal(count(api, "mail014A04"), 1);
+  }
+});
+
+test("send: a send refused for the session stays a SessionError (it never ran)", async () => {
+  await assert.rejects(sendTo(mailApi({ send: unauthorized }), { confirm: true }), SessionError);
+});
+
+test("delete mail: a preview names the folder and moves nothing; confirm moves them to the trash once", async () => {
+  const api = mailApi();
+  assert.deepEqual(await deleteMail(MAILER, { muids: [9, "10", 9], box: "inbox" }, { fetch: api.fetch }),
+    { box: "INBOX", muids: ["9", "10"] });
+  assert.equal(count(api, "mail002A05"), 0);
+  const out = await deleteMail(MAILER, { muids: [9, "10"], box: "INBOX", confirm: true }, { fetch: api.fetch });
+  assert.equal(out.trashed, true);
+  assert.equal(count(api, "mail002A05"), 1);
+  assert.deepEqual(bodyOf(api, "mail002A05"), { uids: "9,10", mailKey: "", boxName: "INBOX" });
+});
+
+test("delete mail: the trash, spam, a scheduled send or an unknown folder is refused", async () => {
+  for (const box of ["TRASH", "spam", "RESERVATION", "ALL", "없는함"]) {
+    const api = mailApi();
+    await assert.rejects(deleteMail(MAILER, { muids: [9], box, confirm: true }, { fetch: api.fetch }), GroupwareError);
+    assert.equal(count(api, "mail002A05"), 0);
+  }
+});
+
+test("muids must be 1 to 50 mail numbers", async () => {
+  for (const muids of [[], ["9,10"], ["x"], null, Array.from({ length: 51 }, (_, i) => i + 1)]) {
+    const api = mailApi();
+    await assert.rejects(markMail(MAILER, { muids }, { fetch: api.fetch }), GroupwareError);
+    await assert.rejects(deleteMail(MAILER, { muids, confirm: true }, { fetch: api.fetch }), GroupwareError);
+    assert.equal(api.calls.length, 0);
+  }
+});
+
+test("mark: unread by default, read when asked, in the mail's folder", async () => {
+  const api = mailApi();
+  assert.deepEqual(await markMail(MAILER, { muids: [9, 10], box: "INBOX" }, { fetch: api.fetch }),
+    { box: "INBOX", muids: ["9", "10"], unread: true });
+  assert.deepEqual(bodyOf(api, "mail002A15"), { mbox: "INBOX", uids: "9,10", type: "unseen" });
+  await markMail(MAILER, { muids: [9], box: "INBOX", read: true }, { fetch: api.fetch });
+  assert.deepEqual(api.calls.filter((c) => c.path.endsWith("mail002A15")).map((c) => c.body.type), ["unseen", "seen"]);
+});

@@ -186,6 +186,7 @@ export async function fetchMailList(session, { box = "INBOX", count = 20, unread
   const data = await request(session, `/mail/${code}`, body, { fetch });
   return ((data || {}).Records || []).map((m) => ({
     muid: m.muid ?? null,
+    box: m.boxName || "",   // the mail's own folder, even in the all-mail list: mail_mark and mail_delete need it
     from: m.fromAddrName || m.fromAddrEmail || "",
     subject: m.subject || "",
     date: fmtStamp(m.tooltipDate),   // rfc822date is display-only: "10-15 04:19"

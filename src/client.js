@@ -76,7 +76,9 @@ export function sign(signKey, token, tid, ts, pathname) {
   return createHmac("sha256", signKey).update(token + tid + ts + pathname).digest("base64");
 }
 
-export async function request(session, pathname, body, { fetch = globalThis.fetch } = {}) {
+/** A signed POST: body as JSON, or a FormData as multipart. Returns resultData; with full, the whole reply,
+ * its resultCode left to the caller (a send's "1" means sent with some recipients left out). */
+export async function request(session, pathname, body, { fetch = globalThis.fetch, full = false } = {}) {
   const path = pathname.split(/[?#]/)[0];
   const id = tid(), ts = now();
   const { base, token, signKey } = session;
@@ -87,7 +89,7 @@ export async function request(session, pathname, body, { fetch = globalThis.fetc
     "transaction-id": id,
     "wehago-sign": sign(signKey, token, id, ts, path),
     "access-domain": base,
-    "content-type": "application/json",
+    ...(body instanceof FormData ? {} : { "content-type": "application/json" }),   // fetch sets the boundary
     // the klago gateway authenticates on BIZCUBE_AT/HK, built from the token (not the jar's oAuthToken)
     cookie: `oAuthToken=${token}; signKey=${signKey}; BIZCUBE_AT=${token}; BIZCUBE_HK=${signKey}; BIZCUBE_TYPE=Web`,
     origin: base,
@@ -95,7 +97,8 @@ export async function request(session, pathname, body, { fetch = globalThis.fetc
   };
   let outcome = "no response";
   try {
-    const resp = await send(fetch, base + pathname, { method: "POST", headers, body: JSON.stringify(body) });
+    const resp = await send(fetch, base + pathname, { method: "POST", headers,
+      body: body instanceof FormData ? body : JSON.stringify(body) });
     outcome = `HTTP ${resp.status}`;
     if (resp.status === 401 || resp.status === 403) throw new SessionError(`${path}: HTTP ${resp.status}`);
     if (!resp.text) throw new GroupwareError(`${path}: empty response (missing required field?)`);
@@ -109,6 +112,7 @@ export async function request(session, pathname, body, { fetch = globalThis.fetc
     outcome += ` resultCode=${data.resultCode}`;
     const errors = isObject(data.errors) ? data.errors : {};
     if (errors.code === "E002" || data.resultMsg === "SESSION_MISMATCH") throw new SessionError(`${path}: session expired`);
+    if (full) return data;
     if (!["0", "200"].includes(String(data.resultCode))) {
       throw new GroupwareError(`${path}: ${data.resultMsg || errors.message || "error"}`);
     }
@@ -196,6 +200,7 @@ function sessionFromInfo(base, info) {
       compSeq: uc.compSeq ?? null, groupSeq: uc.groupSeq ?? null,
       empSeq: uc.empSeq ?? null, deptSeq: uc.deptSeq ?? null,
       empName: uc.empName || "",
+      email,   // whole, as the web client sends it in a mail's authToken
       emailAddr: at < 0 ? email : email.slice(0, at),
       emailDomain: uc.emailDomain || (at < 0 ? "" : email.slice(at + 1)),
       erpEmpCd: erp.userCode ?? null, erpCoCd: erp.companyCode ?? null,

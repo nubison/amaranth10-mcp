@@ -62,6 +62,23 @@ test("request headers, cookies and a signature over the path without the query",
   assert.equal(h["content-type"], "application/json");
 });
 
+test("a FormData body goes as multipart, and full hands back the whole reply unchecked", async (t) => {
+  captureStderr(t);
+  const seen = [];
+  const fetch = async (url, init) => {
+    seen.push(init);
+    return json({ resultCode: 1, resultMsg: "x@other.com", resultData: {} });
+  };
+  const form = new FormData();
+  form.append("subject", "보고");
+  assert.deepEqual(await request(SESSION, "/mail/mail014A04", form, { fetch, full: true }),
+    { resultCode: 1, resultMsg: "x@other.com", resultData: {} });
+  assert.equal(seen[0].body, form);
+  assert.equal(seen[0].headers["content-type"], undefined);   // fetch adds multipart with its boundary
+  assert.ok(seen[0].headers["wehago-sign"]);
+  await assert.rejects(request(SESSION, "/mail/mail014A04", form, { fetch }), GroupwareError);   // without full, 1 is a failure
+});
+
 test("request maps failures like the python client", async (t) => {
   captureStderr(t);
   const cases = [
@@ -220,7 +237,8 @@ test("login maps sessionInfo to the session's user", async (t) => {
   const { result } = await pwLogin();
   assert.deepEqual(result.user, {
     compSeq: "1000", groupSeq: "G1", empSeq: "E1", deptSeq: "D1",
-    empName: "홍길동", emailAddr: "hong", emailDomain: "example.com", erpEmpCd: "12345", erpCoCd: "1000",
+    empName: "홍길동", email: "hong@example.com", emailAddr: "hong", emailDomain: "example.com",
+    erpEmpCd: "12345", erpCoCd: "1000",
   });
   // no guessed company code when erpUserInfo has none
   const info = { ...USER_INFO, erpUserInfo: { userCode: "12345", deptCode: "D9" } };

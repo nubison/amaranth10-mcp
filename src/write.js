@@ -1,9 +1,9 @@
-// Resource and schedule writes: a preview unless args.confirm is exactly true, one write call that
+// Resource, schedule and mail writes: a preview unless args.confirm is exactly true, one write call that
 // is never retried, a read-back, and a result it cannot confirm says to check the groupware instead
 // of inviting another try.
 import { GroupwareError, SessionError, request } from "./client.js";
-import { calendarRows, calendars, companyInfo, fetchResources, fmtStamp, num, parseLocal, resolveAttendees,
-  scheduleRows, toApiDt } from "./read.js";
+import { calendarRows, calendars, companyInfo, fetchMailFolders, fetchResources, fmtStamp, num, parseLocal,
+  resolveAttendees, scheduleRows, toApiDt } from "./read.js";
 
 const CHECK = "그룹웨어에서 확인해 주세요.";
 
@@ -21,9 +21,9 @@ const succeeded = (result) => ["1", "true"].includes(str((isDict(result) ? resul
 // One write call. A SessionError means the gateway refused it before it ran, so the caller's one
 // re-login sends the first write, not a second; anything else unclear may have landed and must
 // say so. No cause is kept: transport text can carry header values.
-async function writeOnce(session, path, body, what, { fetch } = {}) {
+async function writeOnce(session, path, body, what, { fetch, full = false } = {}) {
   try {
-    return await request(session, path, body, { fetch });
+    return await request(session, path, body, { fetch, full });
   } catch (e) {
     if (e instanceof SessionError) throw e;
     if (e instanceof GroupwareError) throw new GroupwareError(`${e.message} ${CHECK}`);
@@ -252,4 +252,123 @@ export async function deleteSchedule(session, { sch_seq, confirm = false } = {},
   if (rows === null) throw new GroupwareError(`일정 삭제 결과를 확인하지 못했습니다. ${CHECK}`);
   if (rows.some((r) => str(r.schSeq) === str(sch))) throw new GroupwareError(`삭제 뒤에도 일정이 남아 있습니다. ${CHECK}`);
   return { ...preview, deleted: true };
+}
+
+// ---- mail
+const ADDRESS = /^\s*(?:(.*?)\s*<\s*)?([^\s<>@,;]+@[^\s<>@,;]+\.[^\s<>@,;]+)\s*>?\s*$/;
+const shown = (a) => (a.name ? `${a.name} <${a.email}>` : a.email);
+const joined = (list) => list.map((a) => (a.name ? `${a.name}<${a.email}>` : a.email)).join(",");   // the web client's form
+const html = (text) => String(text).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c])
+  .replace(/\r?\n/g, "<br>");
+const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+// "a@b.com" or "이름 <a@b.com>"; anything else stops the send before the network
+function addresses(list, field) {
+  return (list || []).map((entry) => {
+    const m = ADDRESS.exec(String(entry));
+    if (!m) throw new GroupwareError(`${field}의 '${entry}'은(는) 메일 주소가 아닙니다.`);
+    return { name: m[1] || "", email: m[2] };
+  });
+}
+
+// the compose page's setup call: the sender, and the per-compose keys the send carries back
+async function composeSetup(session, fetch) {
+  const init = (await request(session, "/mail/mail014A01", { mailKind: "plain", mailTo: "", uid: "", mbox: "",
+    viewFlag: "noRead", fromFlag: false, readType: "", domainSeq: "" }, { fetch })) || {};
+  const senders = Array.isArray(init.mail_from) ? init.mail_from : [];
+  if (!init.email || !senders.length) throw new GroupwareError("이 계정에는 메일을 보낼 주소가 없습니다.");
+  if (num(init.useLimit) === 1 || [1, 3].includes(num(init.recvSendRestiction))
+    || (num(init.mailboxPercent) > 100 && ["1", "3"].includes(str(init.capacityLimit)))) {
+    throw new GroupwareError("이 계정은 메일 발송이 제한되어 있습니다. 그룹웨어 관리자에게 문의해 주세요.");
+  }
+  // the web client's choice of sender: the default one if it is still a sender, else the first
+  const user = isDict(init.userInfo) ? init.userInfo : {};
+  const pick = user.defaultuser === "defaultLoginEmail" ? init.email : user.defaultuser;
+  const from = senders.includes(pick) ? pick : senders[0];
+  const names = Array.isArray(init.userFromNameList) ? init.userFromNameList : [];
+  // a representative or shared address goes out under its own name
+  const ownName = ![init.representInfo, init.sharedList].some((l) => Array.isArray(l) && l.includes(from));
+  const fromName = ownName ? (names.find((n) => n.isDefault === true) ?? names[0])?.userName ?? "" : "";
+  return { init, user, from, fromName };
+}
+
+export async function sendMail(session, { to, cc = null, bcc = null, subject, body = "", confirm = false } = {},
+  { fetch, now = () => new Date() } = {}) {
+  const toList = addresses(to, "to");
+  if (!toList.length) throw new GroupwareError("받는 사람(to)을 한 명 이상 넣어 주세요.");
+  // like the web client: an address already in to, or in cc, is not sent again in cc or bcc
+  const seen = new Set(toList.map((a) => a.email.toLowerCase()));
+  const fresh = (list, field) => addresses(list, field).filter((a) => !seen.has(a.email.toLowerCase())
+    && seen.add(a.email.toLowerCase()));
+  const ccList = fresh(cc, "cc"), bccList = fresh(bcc, "bcc");
+  subject = String(subject ?? "").trim();
+  if (!subject) throw new GroupwareError("제목(subject)을 넣어 주세요.");
+  const { init, user, from, fromName } = await composeSetup(session, fetch);
+  const preview = { from: fromName ? `${fromName} <${from}>` : from, to: toList.map(shown), cc: ccList.map(shown),
+    bcc: bccList.map(shown), subject, body };
+  if (confirm !== true) return preview;
+
+  const today = now(), days = num(init.bigFileDay) || 30, until = new Date(today);
+  until.setDate(until.getDate() + days);
+  const group = isDict(init.groupMailOption) ? init.groupMailOption : {};
+  const form = new FormData();
+  // every field the web client's compose form sends for a plain mail without attachments, in its order
+  for (const [k, v] of [
+    ["from", from], ["fromName", fromName], ["to", joined(toList)], ["cc", joined(ccList)], ["bcc", joined(bccList)],
+    ["htmlContents", html(body)], ["email", init.email], ["fileDir", init.filedir ?? ""], ["bigFile", ""],
+    ["bigFileDay", String(days)], ["bigFileCnt", "0"], ["bigFilePeriod", `${ymd(today)} ~ ${ymd(until)}`],
+    ["mail_kind", "plain"], ["uidAuthList", ""], ["fwFile", ""], ["urlList", ""], ["fileNameList", ""],
+    ["receipt_notific", user.receiveconfirm === "0" ? "1" : ""],   // the user's "always ask for a receipt"
+    ["securitymailuse", ""], ["securitymailpass_enc_web", ""], ["immediately", "false"], ["toBeDeleted", "false"],
+    ["expirationDate", `${ymd(today)} 00:00`], ["importantmailuse", ""],
+    ["eachTrans", str(user.eachtrans) === "0" ? "1" : ""],   // and "send to each recipient separately"
+    ["neobizaddr", group.groupMailAddr ?? ""], ["neobizIntedAddr", group.groupMailIntedAddr ?? ""],
+    ["neobizOrg", group.groupMailOrg ?? ""], ["muid", "0"], ["domainSeq", ""], ["mimeHeader", ""],
+    ["sessionKey", init.sessionKey ?? ""], ["externalSendLimit", init.externalSendLimit ?? "N"],
+    ["insideDomainArray", JSON.stringify(init["insideDomainArray[]"] ?? [])], ["aiResultJSON", ""],
+    ["subject", subject], ["authToken", `${session.user.email}|${session.token}`],
+  ]) form.append(k, String(v));
+  const reply = await writeOnce(session, "/mail/mail014A04", form, "메일 발송", { fetch, full: true });
+  const code = str(reply.resultCode);
+  if (code === "1") return { ...preview, sent: true, left_out: String(reply.resultMsg ?? "") };   // external-domain limit
+  if (code !== "0") throw new GroupwareError(`메일 발송 결과를 확인하지 못했습니다(${or(reply.resultMsg, code)}). 보낸메일함을 ${CHECK}`);
+  return { ...preview, sent: true };
+}
+
+// muids as the API joins them: digits only, so a comma or anything else cannot widen the list
+function muidList(muids) {
+  const list = [...new Set((muids || []).map((m) => String(m).trim()))];
+  if (!list.length || list.length > 50) throw new GroupwareError("muids는 1~50개여야 합니다.");
+  if (!list.every((m) => /^\d+$/.test(m))) throw new GroupwareError("muids는 mail_list의 muid 숫자여야 합니다.");
+  return list;
+}
+
+// the folder as the groupware names it; a wrong one would answer success and change nothing
+async function folder(session, box, fetch) {
+  const names = (await fetchMailFolders(session, {}, { fetch })).map((f) => f.name);
+  const name = names.find((n) => n.toLowerCase() === String(box).trim().toLowerCase());
+  if (!name) throw new GroupwareError(`메일함 '${box}'이(가) 없습니다. mail_list 결과의 box 값을 넣어 주세요(${names.join(", ")}).`);
+  return name;
+}
+
+// the web client deletes these for good, or cancels a scheduled send, instead of moving them to the trash
+const FOR_GOOD = new Set(["TRASH", "SPAM", "RESERVATION"]);
+
+export async function deleteMail(session, { muids, box = "INBOX", confirm = false } = {}, { fetch } = {}) {
+  const uids = muidList(muids);
+  if (FOR_GOOD.has(String(box).trim().toUpperCase())) {
+    throw new GroupwareError(`${box}의 메일은 지우면 복구할 수 없어 여기서는 지우지 않습니다. 그룹웨어에서 지워 주세요.`);
+  }
+  const name = await folder(session, box, fetch);
+  const preview = { box: name, muids: uids };
+  if (confirm !== true) return preview;
+  await writeOnce(session, "/mail/mail002A05", { uids: uids.join(","), mailKey: "", boxName: name }, "메일 삭제", { fetch });
+  return { ...preview, trashed: true };
+}
+
+export async function markMail(session, { muids, box = "INBOX", read = false } = {}, { fetch } = {}) {
+  const uids = muidList(muids), name = await folder(session, box, fetch);
+  await writeOnce(session, "/mail/mail002A15", { mbox: name, uids: uids.join(","), type: read === true ? "seen" : "unseen" },
+    "읽음 표시", { fetch });
+  return { box: name, muids: uids, unread: read !== true };
 }
