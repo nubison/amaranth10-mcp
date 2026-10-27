@@ -145,5 +145,13 @@ export function createServer({ gw = new Groupware() } = {}) {
 
 export async function serve() {
   if (process.stdin.isTTY) console.error("amaranth10-mcp: MCP 클라이언트가 실행하는 서버입니다. 설정은 setup 명령으로 합니다(README).");
-  await createServer().connect(new StdioServerTransport());
+  const gw = new Groupware();
+  try {
+    await gw.verify();   // wrong or missing credentials: the client shows a failed server, not a connected one
+  } catch (e) {
+    console.error(`amaranth10-mcp: ${e.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  await createServer({ gw }).connect(new StdioServerTransport());
 }

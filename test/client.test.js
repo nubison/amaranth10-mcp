@@ -9,7 +9,7 @@ import { join } from "node:path";
 
 import {
   GroupwareError, Groupware, LoginRejected, SessionError, UA, credentialsFile,
-  loadCredentials, loginWithPassword, normalizeUrl, request, saveCredentials, sign,
+  loadCredentials, loginWithPassword, normalizeUrl, rejectedFile, request, saveCredentials, sign,
 } from "../src/client.js";
 
 const SIGN_KEY = "test-sign-key";
@@ -408,7 +408,8 @@ test("a rejected login is not retried until the credentials change", async (t) =
   const gw = fakeGroupware({ pw: { resultCode: "E", resultMsg: "비밀번호 불일치" } });
   const env = { ...ENV };
   const g = gwFor(gw, env);
-  const rejected = "그룹웨어 로그인에 실패했습니다(비밀번호 불일치). 비밀번호가 바뀌었다면 setup을 다시 실행해 주세요.";
+  const rejected = "그룹웨어 로그인에 실패했습니다(비밀번호 불일치). 계정이 잠기지 않도록 같은 아이디·비밀번호로는 "
+    + "다시 시도하지 않습니다. 비밀번호가 바뀌었다면 setup을 다시 실행하거나 설정에서 고쳐 주세요.";
   await assert.rejects(g.call(alerts), (e) => e instanceof GroupwareError && e.message === rejected);
   const sent = gw.sent();
   for (let i = 0; i < 3; i++) await assert.rejects(g.call(alerts), { message: rejected });
@@ -435,6 +436,46 @@ test("every refused password is remembered, not only the last", async (t) => {
   env.AMARANTH_PASSWORD = ENV.AMARANTH_PASSWORD;
   await assert.rejects(g.call(alerts), /비밀번호 불일치/);   // back to A: still blocked
   assert.equal(gw.posts.length, 4, "two tries, one per password");
+});
+
+test("a refusal is kept on disk, so the next server process sends nothing; setup clears it", async (t) => {
+  captureStderr(t);
+  const gw = fakeGroupware({ pw: { resultCode: "E", resultMsg: "비밀번호 불일치" } });
+  const home = tmpHome();
+  const start = () => new Groupware({ fetch: gw.fetch, env: ENV, home, keychain: null });
+  await assert.rejects(start().call(alerts), /비밀번호 불일치/);
+  const sent = gw.sent();
+  await assert.rejects(start().verify(), /다시 시도하지 않습니다/);   // a client's next launch
+  assert.equal(gw.sent(), sent);
+  const file = rejectedFile(home);
+  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.doesNotMatch(readFileSync(file, "utf8"), /PW-SECRET|hong/);
+  saveCredentials({ url: BASE, id: "hong", password: "PW-SECRET" }, { home });   // setup logged in with them
+  await assert.rejects(start().call(alerts), /비밀번호 불일치/);
+  assert.equal(gw.posts.length, 4, "one more try after setup");
+});
+
+test("verify logs in at startup and the first call reuses that session", async (t) => {
+  captureStderr(t);
+  const gw = fakeGroupware();
+  const g = gwFor(gw);
+  await g.verify();
+  assert.equal(gw.posts.length, 2);
+  assert.equal(await g.call(alerts), "OK");
+  assert.equal(gw.posts.length, 2);
+});
+
+test("verify stops on missing, malformed or refused credentials, not on network trouble", async (t) => {
+  const logs = captureStderr(t);
+  await assert.rejects(gwFor(fakeGroupware(), {}).verify(), { message: NO_CREDENTIALS });
+  await assert.rejects(gwFor(fakeGroupware(), { ...ENV, AMARANTH_URL: "http://gw.example.com" }).verify(), GroupwareError);
+  await assert.rejects(gwFor(fakeGroupware({ pw: { resultCode: "E", resultMsg: "비밀번호 불일치" } })).verify(),
+    /비밀번호 불일치/);
+  const down = gwFor(fakeGroupware({ check: () => { throw new TypeError("fetch failed"); } }));
+  await down.verify();   // the server starts; the first call logs in again
+  assert.match(logs().join("\n"), /startup login skipped: 그룹웨어에 연결하지 못했습니다/);
+  await assert.rejects(down.call(alerts), /연결하지 못했습니다/);
+  await gwFor(fakeGroupware({ group: { resultCode: "0", resultData: {} } })).verify();   // an odd reply, not a refusal
 });
 
 test("a rejection drops the session, so a blocked call sends nothing", async (t) => {

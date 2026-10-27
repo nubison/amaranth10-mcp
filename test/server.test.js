@@ -150,8 +150,9 @@ for (const [tool, args, write, readBack, message] of [
 
 // ---- the bin
 test("server mode writes nothing but MCP frames to stdout", async () => {
-  const transport = new StdioClientTransport({ command: process.execPath, args: [BIN],
-    env: { HOME: tmpHome(), TZ: "UTC" }, stderr: "pipe" });
+  // nothing answers at that address: the startup login is skipped and the server starts
+  const transport = new StdioClientTransport({ command: process.execPath, args: [BIN], stderr: "pipe",
+    env: { HOME: tmpHome(), TZ: "UTC", AMARANTH_URL: "https://127.0.0.1:9", AMARANTH_ID: "hong", AMARANTH_PASSWORD: "pw" } });
   const client = new Client({ name: "test", version: "0" });
   const errors = [];
   client.onerror = (e) => errors.push(e);   // a non-JSON line on stdout lands here
@@ -160,11 +161,19 @@ test("server mode writes nothing but MCP frames to stdout", async () => {
     assert.equal(client.getServerVersion().version, VERSION);
     assert.equal((await client.listTools()).tools.length, 24);
     const out = await client.callTool({ name: "alerts", arguments: {} });
-    assert.deepEqual([out.isError, texts(out)], [true, [["text", NO_CREDENTIALS]]]);
+    assert.equal(out.isError, true);
+    assert.match(texts(out)[0][1], /^그룹웨어에 연결하지 못했습니다/);
   } finally {
     await client.close();
   }
   assert.deepEqual(errors, []);
+});
+
+test("server mode stops before connecting when no credentials are set", () => {
+  const r = spawnSync(process.execPath, [BIN], { encoding: "utf8", input: "", env: { PATH: process.env.PATH, HOME: tmpHome() } });
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, "");
+  assert.ok(r.stderr.includes(NO_CREDENTIALS));
 });
 
 const run = (args, env = {}) => spawnSync(process.execPath, args, { encoding: "utf8", env: { ...process.env, ...env } });

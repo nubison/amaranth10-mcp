@@ -1,7 +1,7 @@
 // Amaranth 10 groupware core: request signing, the password login, credentials and the
 // in-memory session. Logs go to stderr (console.error), never stdout: that is MCP's.
 import { spawnSync } from "node:child_process";
-import { createHash, createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, scryptSync } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,14 +14,17 @@ const TIMEOUT_MS = 15000;   // the Python server's httpx timeout
 
 const NO_CREDENTIALS = "그룹웨어 주소·아이디·비밀번호가 설정되지 않았습니다. README의 설치 안내대로 터미널에서 setup을 실행해 주세요.";
 const SESSION_LOST = "세션이 다시 끊겼습니다. 잠시 후 다시 요청해 주세요.";
-const rejectedText = (message) =>
-  `그룹웨어 로그인에 실패했습니다(${message}). 비밀번호가 바뀌었다면 setup을 다시 실행해 주세요.`;
+const rejectedText = (message) => `그룹웨어 로그인에 실패했습니다(${message}). 계정이 잠기지 않도록 같은 `
+  + "아이디·비밀번호로는 다시 시도하지 않습니다. 비밀번호가 바뀌었다면 setup을 다시 실행하거나 설정에서 고쳐 주세요.";
 
 /** A groupware API returned a failure the model should see. */
 export class GroupwareError extends Error {}
 
 /** Session missing or expired; the caller should log in again. */
 export class SessionError extends Error {}
+
+/** No usable address, id or password: the server cannot work until someone fixes them. */
+class CredentialsError extends GroupwareError {}
 
 /** The groupware refused the id or the password (not a network or mapping failure). */
 export class LoginRejected extends GroupwareError {
@@ -221,6 +224,23 @@ export async function loginWithPassword({ url, id, password }, { fetch = globalT
 }
 
 export const credentialsFile = (home = homedir()) => join(home, ".config", "amaranth10-mcp", "credentials.json");
+export const rejectedFile = (home = homedir()) => join(home, ".config", "amaranth10-mcp", "rejected.json");
+
+// owner-only: the dir 0700 however it got made, the file written 0600 as a fresh temp file ("wx", so a
+// leftover's looser bits are never reused) and renamed into place; no copy stays behind when a step fails
+function writePrivate(file, text) {
+  const dir = dirname(file), tmp = `${file}.${process.pid}.tmp`;
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  rmSync(tmp, { force: true });
+  try {
+    writeFileSync(tmp, text, { mode: 0o600, flag: "wx" });
+    renameSync(tmp, file);
+  } catch (e) {
+    rmSync(tmp, { force: true });
+    throw e;
+  }
+}
 
 // macOS Keychain through /usr/bin/security. The password goes in on stdin (`security -i`), never in
 // argv where other users' `ps` sees it, and as base64, since `-w` prints a non-ASCII one back as hex.
@@ -259,23 +279,11 @@ export function loadCredentials({ env = process.env, home = homedir(), keychain 
 }
 
 /** The password into the keychain when there is one (else the file); the address and id into the file,
- * owner-only: the dir 0700 however it got made, the file written 0600 and renamed into place.
- * Returns where the password went: "keychain" or "file". */
+ * owner-only. Returns where the password went: "keychain" or "file". */
 export function saveCredentials({ url, id, password }, { home = homedir(), keychain = null } = {}) {
   const where = keychain?.save(keychainAccount(url, id), password) ? "keychain" : "file";
-  const file = credentialsFile(home), dir = dirname(file), tmp = `${file}.${process.pid}.tmp`;
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  chmodSync(dir, 0o700);
-  // always a new file ("wx"), so a leftover's looser bits are never reused, and no copy of the
-  // password stays behind when the write or the rename fails
-  rmSync(tmp, { force: true });
-  try {
-    writeFileSync(tmp, JSON.stringify(where === "keychain" ? { url, id } : { url, id, password }), { mode: 0o600, flag: "wx" });
-    renameSync(tmp, file);
-  } catch (e) {
-    rmSync(tmp, { force: true });
-    throw e;
-  }
+  writePrivate(credentialsFile(home), JSON.stringify(where === "keychain" ? { url, id } : { url, id, password }));
+  rmSync(rejectedFile(home), { force: true });   // setup checked them: even a once-refused password gets its try
   return where;
 }
 
@@ -286,12 +294,13 @@ function toGroupwareError(e) {
   return new GroupwareError(`${e?.name}: ${e?.message}`);   // bad dates, odd response shapes
 }
 
-/** The in-memory session: the first call logs in, one re-login per call, no retry of a refused password. */
+/** The in-memory session: verify or the first call logs in, one re-login per call, and a refused password
+ * is never sent again, not by this process nor by the next one (a client starts one per launch). */
 export class Groupware {
   #fetch; #env; #home; #keychain;
   #session = null;
   #login = null;      // the login in flight, shared by the calls that need it
-  #rejected = new Map();   // fingerprint -> message, for every refused url + id + password
+  #refused = null;   // {salt, hashes: {scrypt of url + id + password: message}}, kept in rejectedFile too
 
   constructor({ fetch = globalThis.fetch, env = process.env, home = homedir(), keychain = defaultKeychain } = {}) {
     this.#fetch = fetch;
@@ -318,6 +327,17 @@ export class Groupware {
     }
   }
 
+  /** At startup: one login, so missing or refused credentials stop the server before a client shows it
+   * connected. Network trouble and odd replies do not; the first call tries again. */
+  async verify() {
+    try {
+      await this.#relogin(null);
+    } catch (e) {
+      if (e instanceof CredentialsError) throw e;
+      console.error(`startup login skipped: ${toGroupwareError(e).message}`);
+    }
+  }
+
   #relogin(stale) {
     if (this.#session && this.#session !== stale) return this.#session;   // another call already did
     this.#login ??= this.#doLogin().finally(() => { this.#login = null; });
@@ -326,19 +346,42 @@ export class Groupware {
 
   async #doLogin() {
     const creds = loadCredentials({ env: this.#env, home: this.#home, keychain: this.#keychain });
-    if (!creds) throw new GroupwareError(NO_CREDENTIALS);
-    const url = normalizeUrl(creds.url);   // one fingerprint however the same address is written
-    const fingerprint = createHash("sha256").update(`${url}\0${creds.id}\0${creds.password}`).digest("hex");
-    // never retried: a retry loop could lock the account. New credentials get one try.
-    if (this.#rejected.has(fingerprint)) throw new GroupwareError(rejectedText(this.#rejected.get(fingerprint)));
+    if (!creds) throw new CredentialsError(NO_CREDENTIALS);
+    let url;
+    try {
+      url = normalizeUrl(creds.url);   // one hash however the same address is written
+    } catch (e) {
+      throw new CredentialsError(e.message);
+    }
+    // never retried: a retry loop, or a client starting the server again and again, could lock the
+    // account. New credentials get one try. scrypt, so the file is no quick way to guess the password.
+    const book = this.#refusals();
+    const hash = scryptSync(`${url}\0${creds.id}\0${creds.password}`, book.salt, 32).toString("hex");
+    if (Object.hasOwn(book.hashes, hash)) throw new CredentialsError(rejectedText(book.hashes[hash]));
     try {
       this.#session = await loginWithPassword({ ...creds, url }, { fetch: this.#fetch });
       return this.#session;
     } catch (e) {
       if (!(e instanceof LoginRejected)) throw e;   // transport errors and odd replies may be retried
-      this.#rejected.set(fingerprint, e.message);
+      book.hashes[hash] = e.message;
+      try {
+        writePrivate(rejectedFile(this.#home), JSON.stringify(book));
+      } catch {
+        // a read-only home: this process still remembers it
+      }
       this.#session = null;   // so a blocked call sends nothing, not even with the stale session
-      throw new GroupwareError(rejectedText(e.message));
+      throw new CredentialsError(rejectedText(e.message));
     }
+  }
+
+  // every refusal so far: the file's, which other server processes write too, else this process's own
+  #refusals() {
+    try {
+      const book = JSON.parse(readFileSync(rejectedFile(this.#home), "utf8"));
+      if (typeof book?.salt === "string" && isObject(book.hashes)) return (this.#refused = book);
+    } catch {
+      // none yet, or unreadable
+    }
+    return (this.#refused ??= { salt: randomBytes(16).toString("hex"), hashes: {} });
   }
 }
