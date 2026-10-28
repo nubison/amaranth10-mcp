@@ -1,108 +1,29 @@
 // The reads: each fetchX(session, args, {fetch}) takes the tool's parameters by their names and
 // returns the objects the tool answers with.
 import { GroupwareError, request } from "./client.js";
-import html5 from "./entities.js";
 
-// ---- HTML to text (mirrors _Text + _clean; every step is linear: no backtracking regexes
-// over other people's mail, no per-line regex on a long run of spaces)
-const SKIP = new Set(["style", "script", "title"]);
-const BREAK = new Set(["br", "p", "div", "li", "tr", "td", "th", "table", "ul", "ol",
-  "blockquote", "h1", "h2", "h3", "h4", "h5", "h6"]);
-// CPython's html.unescape: html5 is its entity table (names with and without ";")
-const INVALID_CHARREFS = { 0: "\ufffd", 13: "\r", 128: "\u20ac", 129: "\x81", 130: "\u201a", 131: "\u0192",
-  132: "\u201e", 133: "\u2026", 134: "\u2020", 135: "\u2021", 136: "\u02c6", 137: "\u2030", 138: "\u0160",
-  139: "\u2039", 140: "\u0152", 141: "\x8d", 142: "\u017d", 143: "\x8f", 144: "\x90", 145: "\u2018",
-  146: "\u2019", 147: "\u201c", 148: "\u201d", 149: "\u2022", 150: "\u2013", 151: "\u2014", 152: "\u02dc",
-  153: "\u2122", 154: "\u0161", 155: "\u203a", 156: "\u0153", 157: "\x9d", 158: "\u017e", 159: "\u0178" };
-const invalidCodepoint = (n) => (n >= 1 && n <= 8) || n === 11 || (n >= 14 && n <= 31) || (n >= 127 && n <= 159)
-  || (n >= 0xfdd0 && n <= 0xfdef) || (n & 0xfffe) === 0xfffe;
-const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
-function replaceCharref(s) {
-  if (s[0] === "#") {
-    const num = /^#[xX]/.test(s) ? parseInt(s.slice(2).replace(/;$/, ""), 16) : parseInt(s.slice(1).replace(/;$/, ""), 10);
-    if (has(INVALID_CHARREFS, num)) return INVALID_CHARREFS[num];
-    if ((num >= 0xd800 && num <= 0xdfff) || num > 0x10ffff) return "\ufffd";
-    return invalidCodepoint(num) ? "" : String.fromCodePoint(num);
-  }
-  if (has(html5, s)) return html5[s];
-  for (let x = s.length - 1; x > 1; x--) if (has(html5, s.slice(0, x))) return html5[s.slice(0, x)] + s.slice(x);
-  return "&" + s;
-}
-
-export function unescape(s) {
-  return s.replace(/&(#[0-9]+;?|#[xX][0-9a-fA-F]+;?|[^\t\n\f <&#;]{1,32};?)/g, (_, g) => replaceCharref(g));
-}
-const ZERO_WIDTH = /[​‌‍⁠﻿]/g;
-
-// index of the ">" that ends the tag starting at i, skipping quoted attribute values; -1 if none.
-// A quote opens a value only after "="; one with no closer is plain text (and is not searched again).
-function tagEnd(s, i, noQuote) {
-  for (; i < s.length; i++) {
-    const ch = s[i];
-    if (ch === ">") return i;
-    if (ch !== "=") continue;
-    let j = i + 1;
-    while (j < s.length && /\s/.test(s[j])) j++;
-    const q = s[j];
-    if ((q !== '"' && q !== "'") || noQuote.has(q)) continue;
-    const close = s.indexOf(q, j + 1);
-    if (close < 0) noQuote.add(q);
-    else i = close;
-  }
-  return -1;
-}
+// ---- HTML to text. Other people's HTML is only reduced to text, never followed. Every pattern is
+// linear: a tag match cannot run past the next "<", so hostile mail cannot stall the scan.
+const BREAK = /^(br|p|div|li|tr|td|th|table|ul|ol|blockquote|h[1-6])$/i;
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: "\u00a0", middot: "·", bull: "•",
+  hellip: "…", ndash: "–", mdash: "—", lsquo: "‘", rsquo: "’", ldquo: "“", rdquo: "”", laquo: "«", raquo: "»",
+  copy: "©", reg: "®", trade: "™", deg: "°", plusmn: "±", times: "×", divide: "÷", euro: "€", yen: "¥", pound: "£",
+  cent: "¢", sect: "§", para: "¶", larr: "←", rarr: "→", uarr: "↑", darr: "↓", zwnj: "\u200c", zwj: "\u200d",
+  shy: "\u00ad", ensp: "\u2002", emsp: "\u2003", thinsp: "\u2009" };
+const unescape = (s) => s.replace(/&(?:#(\d+)|#x([\da-f]+)|([a-z][a-z\d]*));/gi, (m, dec, hex, name) => {
+  if (name) return Object.hasOwn(ENTITIES, name) ? ENTITIES[name] : m;
+  const n = dec ? Number(dec) : parseInt(hex, 16);
+  return n > 0 && n <= 0x10ffff ? String.fromCodePoint(n) : "\ufffd";
+});
 
 export function clean(text, limit = 4000) {
-  const s = String(text ?? "");
-  const out = [];
-  let skip = 0, i = 0, noGt = false;
-  const noQuote = new Set();
-  const data = (end) => { if (!skip && end > i) out.push(unescape(s.slice(i, end))); };
-  while (i < s.length) {
-    const lt = s.indexOf("<", i);
-    if (lt < 0) { data(s.length); break; }
-    const next = s[lt + 1] ?? "";
-    let gt = -1;
-    if (s.startsWith("<!--", lt)) {
-      const e = s.indexOf("-->", lt + 4);
-      data(lt); i = e < 0 ? s.length : e + 3;
-      continue;
-    }
-    const opens = /[a-zA-Z/!?]/.test(next);
-    if (opens && !noGt) {
-      gt = tagEnd(s, lt + 1, noQuote);
-      if (gt < 0) noGt = true;   // no ">" anywhere after: don't search again
-    }
-    // Python's parser keeps an unterminated "<x", "</", "<!" or "<?" in its buffer and close() drops it
-    if (gt < 0 && opens) {
-      data(lt);
-      break;
-    }
-    if (gt < 0) {   // a "<" that opens no tag is text; resume right after it
-      data(lt + 1); i = lt + 1;
-      continue;
-    }
-    data(lt);
-    const m = /^<(\/?)([a-zA-Z][^\s/>]*)/.exec(s.slice(lt, Math.min(gt + 1, lt + 40)));
-    i = gt + 1;
-    if (!m) continue;   // <!doctype>, <?xml?>, "</ >"
-    const tag = m[2].toLowerCase();
-    if (SKIP.has(tag)) {
-      skip = m[1] ? Math.max(0, skip - 1) : skip + 1;
-      if (!m[1] && tag !== "title") {   // style/script content is raw text up to the closing tag
-        const close = new RegExp(`</${tag}`, "gi");
-        close.lastIndex = i;
-        const c = close.exec(s);
-        const e = c ? s.indexOf(">", c.index) : -1;
-        if (!c || e < 0) break;   // unclosed: the rest is inside the block
-        i = e + 1; skip--;
-      }
-    } else if (BREAK.has(tag)) out.push("\n");
-  }
-  const lines = out.join("").replace(ZERO_WIDTH, "").split("\n").map((l) => l.trim());
-  let res = lines.filter(Boolean).join("\n");
-  if (res.length > limit) res = res.slice(0, limit) + " …(생략)";
-  return res;
+  const s = unescape(String(text ?? "")
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, "")
+    .replace(/<(script|style|title)\b[\s\S]*?(?:<\/\1\s*>|$)/gi, "")   // unclosed: the rest is inside
+    .replace(/<\/?([a-z][^\s/<>]*)(?:[\s/][^<>]*)?>|<[!?/][^<>]*>/gi, (_, tag) => (BREAK.test(tag) ? "\n" : "")))
+    .replace(/[\u200b-\u200d\u2060\ufeff]/g, "")   // preview padding
+    .split("\n").map((l) => l.trim()).filter(Boolean).join("\n");
+  return s.length > limit ? `${s.slice(0, limit)} …(생략)` : s;
 }
 
 // ---- small helpers
@@ -114,13 +35,25 @@ export const fmtDate = (ymd) => {
   const d = String(ymd ?? "").replace(/\D/g, "");
   return d.length >= 8 ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : "";
 };
-// strptime("%Y-%m-%d") takes an unpadded month or day; a plain Error, like Python's ValueError
+const pad = (n) => String(n).padStart(2, "0");
+export const ymdOf = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;   // local time
+// an unpadded month or day passes; a day the month does not have does not
+const realDay = ([, y, mo, d]) => mo >= 1 && mo <= 12 && d >= 1 && d <= new Date(Date.UTC(y, mo, 0)).getUTCDate();
 export function toApiDay(s) {
   const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(s));
-  const [y, mo, d] = m ? m.slice(1).map(Number) : [];
-  const ok = m && mo >= 1 && mo <= 12 && d >= 1 && d <= new Date(Date.UTC(y, mo, 0)).getUTCDate();
-  if (!ok) throw new Error(`날짜 '${s}'은(는) 'YYYY-MM-DD' 형식이어야 합니다.`);
-  return `${m[1]}${String(mo).padStart(2, "0")}${String(d).padStart(2, "0")}`;
+  if (!m || !realDay(m)) throw new Error(`날짜 '${s}'은(는) 'YYYY-MM-DD' 형식이어야 합니다.`);
+  return m[1] + pad(m[2]) + pad(m[3]);
+}
+export function parseLocal(s) {
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{1,2})$/.exec(String(s));
+  if (!m || !realDay(m) || m[4] > 23 || m[5] > 59) throw new Error(`시각 '${s}'은(는) 'YYYY-MM-DD HH:MM' 형식이어야 합니다.`);
+  const date = new Date(2000, m[2] - 1, m[3], m[4], m[5]);
+  date.setFullYear(m[1]);   // a two-digit year would land in the 1900s
+  return date;
+}
+export function toApiDt(s) {
+  const d = parseLocal(s);
+  return `${ymdOf(d)}${pad(d.getHours())}${pad(d.getMinutes())}`;
 }
 // YYYYMMDD strings compare as dates; a reversed range would quietly answer for some other period
 function inOrder(first, last) {
@@ -129,18 +62,9 @@ function inOrder(first, last) {
   }
   return [first, last];
 }
-const pad = (n) => String(n).padStart(2, "0");
-export const ymdOf = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;   // local time, like datetime.now()
-// Python's float(): "-", "----", "" and null are the API's empties and read as 0
-export const num = (v) => {
-  if (typeof v === "number" || typeof v === "boolean") return Number(v);
-  return typeof v === "string" && /^\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?\s*$/.test(v) ? Number(v) : 0;
-};
-const truthy = (v) => v === true || String(v).toLowerCase() === "true";
-const fileName = (f) => {
-  const name = f.originalFileName || "", ext = f.fileExtsn || "";
-  return ext && !name.toLowerCase().endsWith(`.${ext.toLowerCase()}`) ? `${name}.${ext}` : name;
-};
+// "-", "----", "" and null are the API's empty counts and read as 0; so does anything not a number
+export const num = (v) => (typeof v === "object" ? 0 : Number(v) || 0);
+const blank = (v) => !v || (typeof v === "object" && !Object.keys(v).length);
 
 // ---- alerts
 export async function fetchAlerts(session, { count = 20 } = {}, { fetch } = {}) {
@@ -163,18 +87,15 @@ async function mailBoxes(session, fetch) {
 }
 
 export async function fetchMailFolders(session, _args = {}, { fetch } = {}) {
-  // the counts arrive as strings ("34")
   return (await mailBoxes(session, fetch)).map((b) => ({ name: b.name || "",
-    unread: Number(b.unseen || 0), total: Number(b.exists || 0) }));
+    unread: Number(b.unseen || 0), total: Number(b.exists || 0) }));   // counts arrive as strings
 }
 
 export async function fetchMailList(session, { box = "INBOX", count = 20, unread_only = false, page = 1,
   query = "", flagged_only = false, with_attachments = false, to_me_only = false } = {}, { fetch } = {}) {
   const everything = box.toUpperCase() === "ALL";
-  let boxName, seq;
-  if (everything) [boxName, seq] = ["ALLBOX", "0"];
-  else {
-    // folder ids differ per user, so look them up by name
+  let boxName = "ALLBOX", seq = "0";
+  if (!everything) {   // folder ids differ per user, so look them up by name
     const boxes = await mailBoxes(session, fetch);
     const match = boxes.find((b) => String(b.name).toLowerCase() === box.toLowerCase());
     if (!match) {
@@ -182,8 +103,7 @@ export async function fetchMailList(session, { box = "INBOX", count = 20, unread
     }
     [boxName, seq] = [match.name, String(match.mboxSeq)];
   }
-  // mail003A01 lists one folder, mail003A02 lists all mail (it ignores the folder),
-  // mail003A03 searches inside the folder; mail019A01 is only the new-mail poll
+  // mail003A01 lists one folder, mail003A02 lists all mail, mail003A03 searches inside the folder
   const code = query ? "mail003A03" : everything ? "mail003A02" : "mail003A01";
   const body = { boxName, mboxSeq: seq, mainApiCode: code, page, pageSize: count, sort: "rfc822date",
     sortType: "desc", listType: "", showType: "", seen: false };
@@ -198,21 +118,23 @@ export async function fetchMailList(session, { box = "INBOX", count = 20, unread
     subject: m.subject || "",
     date: fmtStamp(m.tooltipDate),   // rfc822date is display-only: "10-15 04:19"
     unread: ["0", "n", "false"].includes(String(m.seen).toLowerCase()),
-    has_attachment: truthy(m.attach),
+    has_attachment: String(m.attach).toLowerCase() === "true",
   }));
 }
 
 export async function fetchMail(session, { muid } = {}, { fetch } = {}) {
   // opening an unread mail marks it read on the server (live-checked 2026-10-16)
   const data = (await request(session, "/mail/mail002A01", { uid: String(muid) }, { fetch })) || {};
-  const head = data.decodeMime || {}, mime = data.mime || {}, body = mime.body || {};
-  // the header fields arrive HTML-escaped: "이름 &lt;a@b.com&gt;"
-  const text = Object.fromEntries(["subject", "from", "to", "cc"].map((k) => [k, unescape(head[k] || "")]));
+  const head = data.decodeMime || {}, mime = data.mime || {};
   return {
-    ...text,
-    date: head.date || "",   // "YYYY-MM-DD HH:MM"
-    body: clean(body.plain || body.html),   // HTML-only mails have no plain part
-    attachments: (mime.fileList || []).map(fileName),
+    // the header fields arrive HTML-escaped: "이름 &lt;a@b.com&gt;"
+    ...Object.fromEntries(["subject", "from", "to", "cc"].map((k) => [k, unescape(head[k] || "")])),
+    date: head.date || "",
+    body: clean(mime.body?.plain || mime.body?.html),   // HTML-only mails have no plain part
+    attachments: (mime.fileList || []).map((f) => {
+      const name = f.originalFileName || "", ext = f.fileExtsn || "";
+      return ext && !name.toLowerCase().endsWith(`.${ext.toLowerCase()}`) ? `${name}.${ext}` : name;
+    }),
   };
 }
 
@@ -223,7 +145,6 @@ export async function collectMailCorrespondence(session, { person, start = null,
     throw new GroupwareError("person은 이름이나 이메일 일부로 2자 이상 넣어 주세요.");
   }
   if (!(limit >= 1 && limit <= 50)) throw new GroupwareError("limit은 1~50 사이여야 합니다.");   // a negative limit would open everything
-  // normalized, so an unpadded "2026-10-1" still compares as a date
   const [first, last] = inOrder(start ? toApiDay(start) : "", end ? toApiDay(end) : "");
   const lo = first ? fmtDate(first) : "", hi = last ? fmtDate(last) : "9999-12-31";
   // ponytail: the first search page only (50 rows); older mail with this person can be missed
@@ -236,7 +157,7 @@ export async function collectMailCorrespondence(session, { person, start = null,
     const head = await fetchMail(session, { muid: m.muid }, { fetch });
     if ([head.from, head.to, head.cc].join("\n").toLowerCase().includes(needle)) found.push(m);
   }
-  return found.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+  return found.sort((a, b) => (a.date > b.date) - (a.date < b.date));
 }
 
 // ---- boards
@@ -263,7 +184,7 @@ export async function fetchBoardPosts(session, { board_id, page = 1, count = 20,
     author: a.mbr_nick || "",
     date: fmtStamp(a.write_date_origin || a.write_date),   // list write_date is date-only
     unread: String(a.art_read_yn) !== "Y",
-    comments: num(a.comment_cnt),   // the count arrives as a string ("1"), or null for none
+    comments: num(a.comment_cnt),   // a string ("1"), or null for none
     notice: String(a.notice_yn) === "Y",
   }));
 }
@@ -272,9 +193,9 @@ export async function searchBoardPosts(session, { query, field = "title", board_
   { fetch } = {}) {
   query = query.trim();
   if (!query) throw new GroupwareError("검색어가 비어 있습니다.");
-  if (!(field in BOARD_FIELDS)) throw new GroupwareError(`field는 ${Object.keys(BOARD_FIELDS).join(", ")} 중 하나여야 합니다.`);
+  if (!Object.hasOwn(BOARD_FIELDS, field)) throw new GroupwareError(`field는 ${Object.keys(BOARD_FIELDS).join(", ")} 중 하나여야 합니다.`);
   let boards = await fetchBoardList(session, {}, { fetch });
-  if (board_id !== null && board_id !== undefined) {
+  if (board_id != null) {
     boards = boards.filter((b) => String(b.board_id) === String(board_id));
     if (!boards.length) throw new GroupwareError(`게시판 ${board_id}을(를) 찾을 수 없습니다.`);
   }
@@ -284,8 +205,7 @@ export async function searchBoardPosts(session, { query, field = "title", board_
     const posts = await fetchBoardPosts(session, { board_id: b.board_id, page: 1, count, query, field }, { fetch });
     hits.push(...posts.map((p) => ({ ...p, board: b.name })));
   }
-  hits.sort((a, b) => (a.date > b.date ? -1 : a.date < b.date ? 1 : 0));
-  return hits.slice(0, count);
+  return hits.sort((a, b) => (b.date > a.date) - (b.date < a.date)).slice(0, count);
 }
 
 export async function fetchBoardPost(session, { art_seq_no } = {}, { fetch } = {}) {
@@ -298,7 +218,7 @@ export async function fetchBoardPost(session, { art_seq_no } = {}, { fetch } = {
   if ((data.view_perm_yn != null && data.view_perm_yn !== "Y") || art.art_password || art.del_yn === "Y") {
     throw new GroupwareError("열람 권한이 없거나 비밀번호가 걸린(또는 삭제된) 글입니다.");
   }
-  // comments live in the groupware's shared comment store (the post view's comment box), not in ViewPost
+  // comments live in the groupware's shared comment store, not in ViewPost
   const talk = (await request(session, "/gw/api/gw026A03", { moduleGbnCode: "board", moduleSeq: String(art_seq_no),
     commentType: "", commentSeq: "", sort: "A", searchWay: "D", pageSize: 1000 }, { fetch })) || {};
   return {
@@ -325,11 +245,10 @@ export async function fetchLeaveBalance(session, _args = {}, { fetch, now = () =
   const today = ymdOf(now());
   const data = await request(session, "/human/common/annualleave/getAnnualLeaveInfoOfEmployee",
     { coCd, empCd, startDate: today, endDate: today, startTm: "0000", endTm: "0000" }, { fetch });
-  if (!data || (typeof data === "object" && !Object.keys(data).length)) throw new GroupwareError("연차 정보를 받지 못했습니다.");
+  if (blank(data)) throw new GroupwareError("연차 정보를 받지 못했습니다.");
   const detail = data.annualLeaveDetail || {};
   const bucket = (prefix) => {
-    const total = num(detail[`${prefix}TotalCnt`]), used = num(detail[`${prefix}UsedCnt`]);
-    const pending = num(detail[`${prefix}ProgressCnt`]);
+    const [total, used, pending] = ["Total", "Used", "Progress"].map((k) => num(detail[`${prefix}${k}Cnt`]));
     return { total, used, pending, remaining: total - used - pending };
   };
   return { year: data.year ?? null, total: num(data.totalCnt), used: num(data.usedCnt),
@@ -337,11 +256,10 @@ export async function fetchLeaveBalance(session, _args = {}, { fetch, now = () =
     compensation: bucket("compensation"), substitute: bucket("substitute") };
 }
 
-// the web client's names (its list screen and APPRO_STATE); 1 seen live, the rest pass through as named there
+// the web client's names for APPRO_STATE; an unknown state passes through
 const LEAVE_STATUS = { "-3": "문서삭제", "-1": "반려취소", 0: "결재진행", 1: "결재완료", 2: "상신대기", 3: "보류", 4: "결재반려",
   5: "임시보관" };
-export const leaveStatus = (r) => r.approStateNm
-  || (has(LEAVE_STATUS, String(r.approState)) ? LEAVE_STATUS[String(r.approState)] : r.approState || "");
+export const leaveStatus = (r) => r.approStateNm || LEAVE_STATUS[r.approState] || r.approState || "";
 
 /** The employee's own attendance applications whose days fall in first..last (YYYYMMDD), one row per stretch. */
 export async function leaveRows(session, first, last, { fetch } = {}) {
@@ -380,7 +298,7 @@ export const companyInfo = (session) => {
     emailAddr: u.emailAddr || "", emailDomain: u.emailDomain || "" };
 };
 
-export async function people(session, name, { fetch } = {}) {
+async function people(session, name, fetch) {
   const rows = await request(session, "/gw/APIHandler/gw102A04", { searchText: name, orgGubunList: ["U"] }, { fetch });
   return Array.isArray(rows) ? rows : [];
 }
@@ -393,15 +311,13 @@ const publicPerson = (p) => ({ name: p.empName || "", department: p.deptName || 
 export async function searchPeople(session, { name } = {}, { fetch } = {}) {
   name = name.trim();
   if ([...name].length < 2) throw new GroupwareError("이름은 2자 이상으로 검색해 주세요.");   // one letter lists nearly everyone
-  return (await people(session, name, { fetch })).slice(0, 20).map(publicPerson);
+  return (await people(session, name, fetch)).slice(0, 20).map(publicPerson);
 }
 
 export async function fetchDeptMembers(session, { dept = null } = {}, { fetch } = {}) {
-  dept = dept !== null && dept !== undefined ? String(dept).trim() : "";
-  if (dept && !(/^[0-9]+$/.test(dept) && /[1-9]/.test(dept))) {
-    throw new GroupwareError("dept는 부서 ID(숫자)입니다. 내 부서는 dept를 비워 두세요.");
-  }
-  const deptSeq = dept || String((session.user || {}).deptSeq || "");
+  dept = String(dept ?? "").trim();
+  if (dept && !/^0*[1-9][0-9]*$/.test(dept)) throw new GroupwareError("dept는 부서 ID(숫자)입니다. 내 부서는 dept를 비워 두세요.");
+  const deptSeq = dept || String(session.user?.deptSeq || "");
   if (!deptSeq) throw new GroupwareError("세션에 부서 정보가 없습니다. 다시 로그인해 주세요.");   // an empty selectedId must never stand for "every department"
   const rows = await request(session, "/gw/APIHandler/gw102A02",
     { orderText: "", selectedId: deptSeq, orgGubun: "d", popupType: "main", selectedType: "tree", searchDiv: "all",
@@ -411,58 +327,42 @@ export async function fetchDeptMembers(session, { dept = null } = {}, { fetch } 
   return (Array.isArray(rows) ? rows : []).filter((p) => p.orgGubun === "u").map(publicPerson);
 }
 
-async function resolveAttendee(session, entry, fetch) {
-  // "이름" or "이름 부서": the hint picks one of several people with the same name
-  const trimmed = entry.trim(), sp = trimmed.indexOf(" ");
-  const name = sp < 0 ? trimmed : trimmed.slice(0, sp);
-  const hint = (sp < 0 ? "" : trimmed.slice(sp + 1)).trim().toLowerCase();
-  const found = (await people(session, name, { fetch })).filter((p) => p.empName === name);
-  const picked = found.filter((p) => String(p.deptName ?? "").toLowerCase().includes(hint));
-  if (picked.length === 1) return picked[0];
-  if (!found.length) throw new GroupwareError(`참석자 '${entry}'을(를) 찾지 못했습니다.`);
-  const list = found.map((p) => `${p.empName} (${p.deptName}/${p.positionName})`).join(", ");
-  throw new GroupwareError(`참석자 '${entry}'을(를) 한 명으로 정하지 못했습니다. 후보: ${list}. '이름 부서'로 지정해 주세요.`);
-}
-
 export async function resolveAttendees(session, entries, { fetch } = {}) {
-  // each entry pinned to one person before anything is written; a person named twice, once
+  // each "이름" or "이름 부서" pinned to one person before anything is written; a person named twice, once
   const out = [];
   for (const entry of entries || []) {
-    const p = await resolveAttendee(session, entry, fetch);
-    if (out.every((q) => String(p.empSeq) !== String(q.empSeq))) out.push(p);
+    const [name, ...rest] = entry.trim().split(" "), hint = rest.join(" ").trim().toLowerCase();
+    const found = (await people(session, name, fetch)).filter((p) => p.empName === name);
+    const picked = found.filter((p) => String(p.deptName ?? "").toLowerCase().includes(hint));
+    if (!found.length) throw new GroupwareError(`참석자 '${entry}'을(를) 찾지 못했습니다.`);
+    if (picked.length !== 1) {
+      const list = found.map((p) => `${p.empName} (${p.deptName}/${p.positionName})`).join(", ");
+      throw new GroupwareError(`참석자 '${entry}'을(를) 한 명으로 정하지 못했습니다. 후보: ${list}. '이름 부서'로 지정해 주세요.`);
+    }
+    if (out.every((q) => String(picked[0].empSeq) !== String(q.empSeq))) out.push(picked[0]);
   }
   return out;
 }
 
-// ---- dates (local time, naive, like Python's datetime.strptime)
-export function parseLocal(s) {
-  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{1,2})$/.exec(String(s));
-  const [y, mo, d, h, mi] = m ? m.slice(1).map(Number) : [];
-  const ok = m && mo >= 1 && mo <= 12 && d >= 1 && d <= new Date(Date.UTC(y, mo, 0)).getUTCDate() && h < 24 && mi < 60;
-  if (!ok) throw new Error(`시각 '${s}'은(는) 'YYYY-MM-DD HH:MM' 형식이어야 합니다.`);
-  const date = new Date(2000, mo - 1, d, h, mi);
-  date.setFullYear(y);
-  return date;
-}
-export function toApiDt(s) {
-  const d = parseLocal(s);
-  return `${ymdOf(d)}${pad(d.getHours())}${pad(d.getMinutes())}`;
-}
-
 // ---- resources
-// Python's `(data or {}).get(key) or []`, with the AttributeError it raises on anything else made
-// explicit: an empty or missing reply is no rows, but a reply that is not a dict holding a list of
-// dicts is an error, never an empty listing (a write's read-back must not read it as "gone")
-const pyEmpty = (v) => !v || (typeof v === "object" && !Object.keys(v).length);
+// an empty or missing reply is no rows, but one that is not a dict holding a list of dicts is an
+// error, never an empty listing (a write's read-back must not read it as "gone")
 const isDict = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 function rowsOf(data, key, path) {
-  if (pyEmpty(data)) return [];
-  const rows = isDict(data) ? data[key] : undefined;
-  if (!isDict(data) || (!pyEmpty(rows) && !(Array.isArray(rows) && rows.every(isDict)))) {
-    throw new GroupwareError(`${path}: unexpected response`);
-  }
-  return pyEmpty(rows) ? [] : rows;
+  const rows = isDict(data) ? data[key] : data;
+  if (blank(rows)) return [];
+  if (isDict(data) && Array.isArray(rows) && rows.every(isDict)) return rows;
+  throw new GroupwareError(`${path}: unexpected response`);
 }
+
+// {startDate, endDate} for the resource APIs, in order
+const dayRange = (start, end) => {
+  const [startDate, endDate] = inOrder(toApiDay(start), toApiDay(end));
+  return { startDate, endDate };
+};
+// the resource module's own labels (/modules/schres); an unknown code passes through as it comes
+const RES_STATUS = { RC: "예약완료", RE: "승인요청", CO: "승인완료", RJ: "반려", CA: "취소", CR: "승인취소", AC: "자동취소" };
+const resStatus = (code) => RES_STATUS[code] ?? code ?? null;
 
 export async function fetchResources(session, { search = "" } = {}, { fetch } = {}) {
   const data = await request(session, "/schres/rs121A01",
@@ -489,7 +389,7 @@ export async function scheduleRows(session, start, end, resSeqs, fetch) {
 export async function fetchResourceSchedule(session, { start, end, res_seqs = null } = {}, { fetch } = {}) {
   dayRange(start, end);   // bad or reversed dates fail before any request
   const known = (await fetchResources(session, {}, { fetch })).map((r) => r.res_seq);
-  if (res_seqs === null || res_seqs === undefined) res_seqs = known;
+  res_seqs ??= known;
   const unknown = res_seqs.filter((s) => !known.some((k) => String(k) === String(s)));
   // an unknown id would be left out silently and read as "no bookings"
   if (unknown.length) throw new GroupwareError(`자원 ${unknown.join(", ")}을(를) 찾을 수 없습니다. resource_list의 res_seq를 넣어 주세요.`);
@@ -502,15 +402,6 @@ export async function fetchResourceSchedule(session, { start, end, res_seqs = nu
     status: resStatus(r.statusCode),
   }));
 }
-
-// the resource module's own labels (/modules/schres); an unknown code passes through as it comes
-const RES_STATUS = { RC: "예약완료", RE: "승인요청", CO: "승인완료", RJ: "반려", CA: "취소", CR: "승인취소", AC: "자동취소" };
-const resStatus = (code) => (has(RES_STATUS, String(code)) ? RES_STATUS[String(code)] : code ?? null);
-// {startDate, endDate} for the resource APIs, in order
-const dayRange = (start, end) => {
-  const [startDate, endDate] = inOrder(toApiDay(start), toApiDay(end));
-  return { startDate, endDate };
-};
 
 export async function fetchMyReservations(session, { start, end } = {}, { fetch } = {}) {
   const data = await request(session, "/schres/rs121A08",
@@ -567,19 +458,17 @@ export async function fetchSchedule(session, { start, end, mine_only = false } =
 }
 
 // ---- approvals
-// per box: path, pageCode, periodPicker, eaBoxId, menuNo, response container
-// (menuNo from the approval side-menu tree; all three listed live 2026-10-16)
+// per box: path, pageCode, periodPicker, eaBoxId, menuNo, response container (all listed live 2026-10-16)
 const APPROVAL_BOXES = {
   submitted: ["/eap/eap107A04", "UBA1010", "REP_DT", "1000300", "1000400", "list"],
   draft: ["/eap/eap107A06", "UBA1020", "REP_DT", "1000300", "1000500", "list"],
   pending: ["/eap/eap105A04", "UBA2020", "ARRIVED_DT", "1000900", "1001000", "map"],
 };
 const DOC_STATUS = { 10: "임시보관", 20: "상신", 90: "종결" };
-const docStatus = (v) => (has(DOC_STATUS, String(v)) ? DOC_STATUS[String(v)] : v);
 
 export async function fetchApprovals(session, { box = "submitted", start = null, end = null, page = 1, count = 20 } = {},
   { fetch, now = () => new Date() } = {}) {
-  if (!has(APPROVAL_BOXES, box)) throw new GroupwareError(`box는 ${Object.keys(APPROVAL_BOXES).join(", ")} 중 하나여야 합니다.`);
+  if (!Object.hasOwn(APPROVAL_BOXES, box)) throw new GroupwareError(`box는 ${Object.keys(APPROVAL_BOXES).join(", ")} 중 하나여야 합니다.`);
   const [path, pageCode, picker, boxId, menuNo, shape] = APPROVAL_BOXES[box];
   const year = now().getFullYear();
   const [first, last] = inOrder(start ? toApiDay(start) : `${year}0101`, end ? toApiDay(end) : `${year}1231`);
@@ -587,12 +476,12 @@ export async function fetchApprovals(session, { box = "submitted", start = null,
     fDocSts: [], page: String(page), pageSize: String(count), eaBoxId: boxId, nMenuID: menuNo, sfrDt: first,
     stoDt: last, sFormId: ["0"], periodPicker: picker, sortField: picker, sortType: "DESC", docContentsData: {},
     item: {}, useElasticSearch: true, useElasticSearch_new: true, pageCode, upperMenuNo: boxId, menuNo }, { fetch });
-  return ((((data || {})[shape]) || {}).list || []).map((d) => ({
+  return (data?.[shape]?.list || []).map((d) => ({
     doc_id: d.DOC_ID ?? null,
     form_id: d.FORM_ID ?? null,
     title: d.DOC_TITLE || "",
     form: d.FORM_NM || "",
-    status: d.DOC_STSNM || docStatus(d.DOC_STS ?? null),
+    status: d.DOC_STSNM || (DOC_STATUS[d.DOC_STS] ?? d.DOC_STS ?? null),
     doc_no: d.DOC_NO || "",
     drafter: d.CREATED_NM || "",
     dept: d.DEPT_NM || "",
@@ -609,7 +498,6 @@ export async function fetchApproval(session, { doc_id, form_id } = {}, { fetch }
   let info = m.appdocinfo || {};
   if (Array.isArray(info)) info = info[0] || {};
   const status = String(data.doc_sts || info.doc_sts || "");
-  const content = (m.appdoccontent && m.appdoccontent.length ? m.appdoccontent : [{}])[0];
   const title = info.doc_title || data.doc_title || "", line = data.jsonKyuljaeArr || [];
   // an unknown id answers success with every field empty; a real document has a title and a line
   if (!title && !line.length) {
@@ -617,7 +505,7 @@ export async function fetchApproval(session, { doc_id, form_id } = {}, { fetch }
   }
   return {
     title,
-    status: docStatus(status),
+    status: DOC_STATUS[status] ?? status,
     drafter: info.user_nm || data.user_nm || "",
     dept: info.dept_nm || data.dept_nm || "",
     form: info.form_nm || "",
@@ -631,8 +519,7 @@ export async function fetchApproval(session, { doc_id, form_id } = {}, { fetch }
       dept: s.dept_nm || "",
     })),
     attachments: (m.fileAttachInfo || []).length,
-    // html is the form template (_DFxx_ placeholders); the filled body is mainhtml, else the
-    // stored contents. Someone else's HTML: cleaned like mail and posts, never followed
-    body: clean(data.mainhtml || content.doc_contents),
+    // html is the form template (_DFxx_ placeholders); the filled body is mainhtml, else the stored contents
+    body: clean(data.mainhtml || m.appdoccontent?.[0]?.doc_contents),
   };
 }
