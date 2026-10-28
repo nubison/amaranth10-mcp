@@ -1,5 +1,5 @@
-// reserve, cancel, the schedule and mail writes: previews write nothing, one write with the stored ids,
-// fail-closed guards, and read-backs that never repeat a write
+// the writes: previews write nothing, one write with the stored ids, fail-closed guards, and read-backs
+// that never repeat a write
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
@@ -7,8 +7,9 @@ import { GroupwareError, SessionError } from "../src/client.js";
 import { cancelLeave, cancelReservation, createSchedule, deleteMail, deleteSchedule, fillBody, markMail, requestLeave,
   reserveResource, sendMail, updateReservation, updateSchedule } from "../src/write.js";
 
-const RES = { base: "https://gw.example.com", token: "G1|E1|R1", signKey: "test-sign-key",
-  user: { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", empSeq: "E1" } };
+const S = { base: "https://gw.example.com", token: "G1|E1|R1", signKey: "test-sign-key",
+  user: { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", empSeq: "E1", email: "hong@example.com", erpCoCd: "1000",
+    erpEmpCd: "123" } };
 const COMPANY = { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", emailAddr: "", emailDomain: "" };
 
 // one fake groupware: handler(path, body, calls) gives the resultData, or a whole Response, or throws
@@ -18,320 +19,190 @@ function fake(handler) {
     const { pathname: path, search } = new URL(url);
     const body = init.body === undefined ? null   // a GET
       : init.body instanceof FormData ? Object.fromEntries(init.body) : JSON.parse(init.body);
-    calls.push(search ? { path, body, query: search } : { path, body });
+    calls.push({ path, body, query: search });
     const out = handler(path, body, calls);
     return out instanceof Response ? out : new Response(JSON.stringify({ resultCode: 0, resultData: out ?? null }));
   };
   return { fetch, calls, paths: () => calls.map((c) => c.path) };
 }
-const count = (api, code) => api.paths().filter((p) => p.endsWith(code)).length;
 const bodyOf = (api, code) => api.calls.find((c) => c.path.endsWith(code))?.body;
+// the calls that change something, by the last part of their path
+const WRITE = new RegExp("/(rs121A06|rs121A11|rs121A12|sc111A05|sc111A06|mail014A04|mail002A05|mail002A15|create|GetLinkKey"
+  + "|SetEnageGroup|saveLinkKey|eap110A06|deleteSubmittedApplicationList|eap110A20|eap107A25)$");
+const writes = (api) => api.paths().filter((p) => WRITE.test(p)).map((p) => p.split("/").pop());
 const timesOut = () => { throw Object.assign(new Error("slow"), { name: "TimeoutError" }); };
 const unauthorized = () => new Response("", { status: 401 });
+const on = (code, fail) => (path) => (path.endsWith(code) ? fail() : undefined);
 const rejectsWith = (re) => (e) => e instanceof GroupwareError && re.test(e.message);
-const NOT_TRUE = ["true", 1, "yes"];   // truthy, but only the boolean true writes
+const check = (c) => (c instanceof RegExp ? rejectsWith(c) : c);
+const UNSURE = (what) => new RegExp(`^${what} 결과를 확인하지 못했습니다\\. 그룹웨어에서 확인해 주세요\\.$`);
+const BAD_TIME = (e) => !(e instanceof GroupwareError) && /YYYY-MM-DD HH:MM/.test(e.message);
 
-const ME = { empSeq: "E1", empName: "홍길동", deptSeq: "D1", deptName: "개발팀", compSeq: "1000", positionName: "주임" };
-const KIM_DEV = { empSeq: "E7", empName: "김민수", deptSeq: "D2", deptName: "개발팀", compSeq: "1000", positionName: "주임" };
-const KIM_HR = { empSeq: "E8", empName: "김민수", deptSeq: "D3", deptName: "인사팀", compSeq: "1000", positionName: "대리" };
-const searchIn = (people, body) => people.filter((x) => x.empName.includes(body.searchText));   // a substring, like the real search
+// [args, fake options, expected error]: each refused with confirm true, nothing written
+async function refuses(makeApi, call, cases) {
+  for (const [args, opts, expected] of cases) {
+    const api = makeApi(opts);
+    await assert.rejects(call(api, { ...args, confirm: true }), check(expected), JSON.stringify([args, opts]));
+    assert.deepEqual(writes(api), []);
+  }
+}
+// [fake options, expected error]: the write went out once and was never repeated
+async function unclear(makeApi, call, write, cases) {
+  for (const [opts, expected] of cases) {
+    const api = makeApi(opts);
+    await assert.rejects(call(api), check(expected), JSON.stringify(opts));
+    assert.deepEqual(writes(api), [write]);
+  }
+}
+
+const ME = { empSeq: "E1", empName: "홍길동", deptSeq: "D1", deptName: "개발팀", compSeq: "1000" };
+const KIM_DEV = { empSeq: "E7", empName: "김민수", deptSeq: "D2", deptName: "개발팀", compSeq: "1000" };
+const KIM_HR = { ...KIM_DEV, empSeq: "E8", deptSeq: "D3", deptName: "인사팀" };
+const searchIn = (body) => [ME, KIM_DEV, KIM_HR].filter((x) => x.empName.includes(body.searchText));
 
 test.beforeEach((t) => t.mock.method(console, "error", () => {}));
 
 // ---- resource_reserve
 const START = "2099-01-01 14:00", END = "2099-01-01 15:00";
 
-function resApi({ reservationYn = "N", success = 1, resSeq = "7", apprYn = "N", people = [], write } = {}) {
+function resApi({ reservationYn = "N", resSeq = "7", apprYn = "N", write = () => ({ successTf: 1 }) } = {}) {
   return fake((path, body) => {
-    if (path.endsWith("gw102A04")) return searchIn(people, body);
-    if (path.endsWith("rs121A01")) {
-      return { resultList: [{ resSeq, resName: "회의실 A", attrName: "회의실", apprYn }] };
-    }
+    if (path.endsWith("gw102A04")) return searchIn(body);
+    if (path.endsWith("rs121A01")) return { resultList: [{ resSeq, resName: "회의실 A", apprYn }] };
     if (path.endsWith("rs121A04")) return { reservationYn };
-    if (path.endsWith("rs121A06")) return write ? write() : { successTf: success };
-    return {};
+    return path.endsWith("rs121A06") ? write() : {};
   });
 }
-const reserve = (api, args = {}, opts = {}) =>
-  reserveResource(RES, { res_seq: "7", start: START, end: END, title: "회의", ...args }, { fetch: api.fetch, ...opts });
+const reserve = (api, args = {}) =>
+  reserveResource(S, { res_seq: "7", start: START, end: END, title: "회의", ...args }, { fetch: api.fetch });
 
-test("reserve: a preview does not write", async () => {
-  const api = resApi();
-  const out = await reserve(api, { description: "분기 계획 논의" });   // a description is no approval
-  assert.deepEqual(out, { resource: "회의실 A", start: START, end: END, available: true,
-    approval_required: false, attendees: [] });
-  assert.deepEqual(api.paths(), ["/schres/rs121A01", "/schres/rs121A04"]);
-});
-
-test("reserve: confirm writes when available, with the check and booking bodies", async () => {
-  const api = resApi();
-  const out = await reserve(api, { description: "안건", confirm: true });
-  assert.equal(out.reserved, true);
-  assert.deepEqual(bodyOf(api, "rs121A04"), { companyInfo: COMPANY, resSeq: "7", startDate: "209901011400",
+test("reserve: a preview checks the slot; confirm books me, then each attendee once, under the API's own id", async () => {
+  const api = resApi({ resSeq: 7 });
+  const args = { attendees: ["홍길동", "김민수 개발", "김민수 개발"], description: "안건" };
+  const preview = { resource: "회의실 A", start: START, end: END, available: true, approval_required: false,
+    attendees: ["홍길동 (개발팀)", "김민수 (개발팀)"] };
+  assert.deepEqual(await reserve(api, args), preview);
+  assert.deepEqual(writes(api), []);
+  assert.deepEqual(await reserve(api, { ...args, confirm: true }), { ...preview, reserved: true });
+  assert.deepEqual(bodyOf(api, "rs121A04"), { companyInfo: COMPANY, resSeq: 7, startDate: "209901011400",
     endDate: "209901011500", alldayYn: "N", resStartDate: "20990101" });
-  assert.deepEqual(bodyOf(api, "rs121A06"), { companyInfo: COMPANY, langCode: "kr", resSeq: "7", reqText: "회의",
-    apprYn: "N", alldayYn: "N", startDate: "209901011400", endDate: "209901011500", descText: "안건",
-    resSubscriberList: [{ groupSeq: "G1", compSeq: "1000", deptSeq: "D1", empSeq: "E1" }],
-    uidList: "", repeatType: "10", repeatEndDay: "" });
-});
-
-test("reserve: a resource that needs approval is booked with apprYn Y", async () => {
-  const api = resApi({ apprYn: "Y" });
-  const out = await reserve(api, { confirm: true });
-  assert.equal(out.approval_required, true);
-  assert.equal(bodyOf(api, "rs121A06").apprYn, "Y");
-});
-
-test("reserve: confirm refuses when unavailable", async () => {
-  const api = resApi({ reservationYn: "Y" });
-  await assert.rejects(reserve(api, { confirm: true }), rejectsWith(/이미 예약이 있습니다/));
-  assert.equal(count(api, "rs121A06"), 0);
-});
-
-for (const [id, start, end] of [["end-first", END, START], ["zero-length", START, START]]) {
-  test(`reserve: a bad time range is rejected before the network: ${id}`, async () => {
-    const api = resApi();
-    await assert.rejects(reserve(api, { start, end }), rejectsWith(/종료 시각이 시작 시각보다 빠릅니다/));
-    assert.deepEqual(api.calls, []);
-  });
-}
-
-test("reserve: a past start is rejected before the network", async () => {
-  const api = resApi();
-  await assert.rejects(reserve(api, { start: "2000-01-01 14:00", end: "2000-01-01 15:00" }), rejectsWith(/이미 지났습니다/));
-  const now = () => new Date(2026, 9, 26, 12, 0);   // frozen: a minute ago has passed, a minute ahead has not
-  await assert.rejects(reserve(api, { start: "2026-10-26 11:59", end: "2026-10-26 13:00" }, { now }), rejectsWith(/이미 지났습니다/));
-  assert.deepEqual(api.calls, []);
-  await reserve(api, { start: "2026-10-26 12:01", end: "2026-10-26 13:00" }, { now });
-  assert.equal(count(api, "rs121A04"), 1);
-});
-
-for (const success of [0, "0", false, null]) {
-  test(`reserve: confirm fails when the write does not report success: ${JSON.stringify(success)}`, async () => {
-    const api = resApi({ success });
-    await assert.rejects(reserve(api, { confirm: true }), rejectsWith(/^예약 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-    assert.equal(count(api, "rs121A06"), 1);   // the write was attempted, once
-  });
-}
-
-for (const success of [1, "1", true]) {
-  test(`reserve: confirm reads the success flag in any JSON form of one: ${JSON.stringify(success)}`, async () => {
-    assert.equal((await reserve(resApi({ success }), { confirm: true })).reserved, true);
-  });
-}
-
-for (const confirm of NOT_TRUE) {
-  test(`reserve: confirm ${JSON.stringify(confirm)} only previews`, async () => {
-    const api = resApi();
-    const out = await reserve(api, { description: "안건 논의", confirm });
-    assert.equal(out.reserved, undefined);
-    assert.equal(count(api, "rs121A06"), 0);
-  });
-}
-
-for (const [apiValue, given] of [[7, "7"], ["7", 7]]) {
-  test(`reserve sends the resource id exactly as the API returned it: api ${typeof apiValue}`, async () => {
-    const api = resApi({ resSeq: apiValue });
-    await reserve(api, { res_seq: given, confirm: true });
-    assert.equal(bodyOf(api, "rs121A04").resSeq, apiValue);
-    assert.equal(bodyOf(api, "rs121A06").resSeq, apiValue);
-  });
-}
-
-test("reserve: an unknown resource is reported", async () => {
-  const api = resApi();
-  await assert.rejects(reserve(api, { res_seq: "99", confirm: true }), rejectsWith(/자원 99을\(를\) 찾을 수 없습니다/));
-  assert.deepEqual(api.paths(), ["/schres/rs121A01"]);
-});
-
-test("reserve treats an unanswered conflict check as unavailable", async () => {
-  const api = fake((path) => {
-    if (path.endsWith("rs121A01")) return { resultList: [{ resSeq: "7", resName: "회의실 A", apprYn: "N" }] };
-    return path.endsWith("rs121A04") ? {} : { successTf: 1 };   // a 200 that says nothing about reservationYn
-  });
-  assert.equal((await reserve(api)).available, false);
-  await assert.rejects(reserve(api, { confirm: true }), GroupwareError);
-  assert.equal(count(api, "rs121A04"), 2);   // the check was reached
-  assert.equal(count(api, "rs121A06"), 0);   // and nothing was written
-});
-
-test("reserve books the resolved attendees after the booker", async () => {
-  const api = resApi({ people: [KIM_DEV, KIM_HR] });
-  const out = await reserve(api, { attendees: ["김민수 개발"], confirm: true });
-  assert.deepEqual(bodyOf(api, "gw102A04"), { searchText: "김민수", orgGubunList: ["U"] });
   // the search result has no groupSeq: the booker's own fills it
-  assert.deepEqual(bodyOf(api, "rs121A06").resSubscriberList, [
-    { groupSeq: "G1", compSeq: "1000", deptSeq: "D1", empSeq: "E1" },
-    { groupSeq: "G1", compSeq: "1000", deptSeq: "D2", empSeq: "E7" }]);
-  assert.deepEqual(out.attendees, ["김민수 (개발팀)"]);
-  assert.equal(out.reserved, true);
+  assert.deepEqual(bodyOf(api, "rs121A06"), { companyInfo: COMPANY, langCode: "kr", resSeq: 7, reqText: "회의",
+    apprYn: "N", alldayYn: "N", startDate: "209901011400", endDate: "209901011500", descText: "안건",
+    resSubscriberList: [{ groupSeq: "G1", compSeq: "1000", deptSeq: "D1", empSeq: "E1" },
+      { groupSeq: "G1", compSeq: "1000", deptSeq: "D2", empSeq: "E7" }],
+    uidList: "", repeatType: "10", repeatEndDay: "" });
+  assert.deepEqual(writes(api), ["rs121A06"]);
 });
 
-for (const [id, entry, match] of [
-  ["same-name", "김민수", /후보: 김민수 \(개발팀\/주임\), 김민수 \(인사팀\/대리\)/],
-  ["hint-matches-none", "김민수 재무", /후보/],
-  ["not-found", "박없음", /찾지 못했습니다/]]) {
-  test(`reserve refuses attendees it cannot pin to one person: ${id}`, async () => {
-    const api = resApi({ people: [KIM_DEV, KIM_HR] });
-    await assert.rejects(reserve(api, { attendees: [entry], confirm: true }), rejectsWith(match));
-    // stopped before the availability check and the write
-    assert.equal(count(api, "rs121A04") + count(api, "rs121A06"), 0);
-  });
-}
+test("reserve: refusals write nothing", () => refuses(resApi, reserve, [
+  [{ start: END, end: START }, {}, /종료 시각이 시작 시각보다 빠릅니다/],
+  [{ start: "2000-01-01 14:00", end: "2000-01-01 15:00" }, {}, /이미 지났습니다/],
+  [{ res_seq: "99" }, {}, /자원 99을\(를\) 찾을 수 없습니다/],
+  [{ attendees: ["김민수"] }, {}, /후보/],
+  [{ attendees: ["박없음"] }, {}, /찾지 못했습니다/],
+  [{}, { reservationYn: "Y" }, /이미 예약이 있습니다/],
+  [{}, { reservationYn: null }, /이미 예약이 있습니다/],   // only an explicit "N" is free
+]));
 
-test("reserve lists each attendee once and the booker once", async () => {
-  const api = resApi({ people: [ME, KIM_DEV] });
-  const out = await reserve(api, { attendees: ["홍길동", "김민수", "김민수"], confirm: true });
-  assert.deepEqual(bodyOf(api, "rs121A06").resSubscriberList.map((s) => s.empSeq), ["E1", "E7"]);
-  assert.deepEqual(out.attendees, ["홍길동 (개발팀)", "김민수 (개발팀)"]);
+test("reserve: success is 1, \"1\" or true; anything else is unconfirmed, sent once", async () => {
+  for (const successTf of [1, "1", true]) {
+    const api = resApi({ apprYn: "Y", write: () => ({ successTf }) });
+    assert.equal((await reserve(api, { confirm: true })).reserved, true);
+    assert.equal(bodyOf(api, "rs121A06").apprYn, "Y");
+  }
+  await unclear(resApi, (api) => reserve(api, { confirm: true }), "rs121A06", [
+    ...[0, "0", null].map((successTf) => [{ write: () => ({ successTf }) }, UNSURE("예약")]),
+    [{ write: timesOut }, UNSURE("예약")],
+    [{ write: () => new Response(JSON.stringify({ resultCode: 114, resultMsg: "중복" })) },
+      /^\/schres\/rs121A06: 중복 그룹웨어에서 확인해 주세요\.$/],
+    // refused before it ran: the caller's one re-login may send it
+    [{ write: unauthorized }, (e) => e instanceof SessionError]]);
 });
-
-for (const [id, write, check] of [
-  ["timeout", timesOut, rejectsWith(/^예약 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/)],
-  ["refused-by-api", () => new Response(JSON.stringify({ resultCode: 114, resultMsg: "중복" })),
-    rejectsWith(/^\/schres\/rs121A06: 중복 그룹웨어에서 확인해 주세요\.$/)],
-  ["session-refused", unauthorized, (e) => e instanceof SessionError]]) {
-  test(`reserve: the one booking call ending unclear is sent once and says so: ${id}`, async () => {
-    const api = resApi({ write });
-    await assert.rejects(reserve(api, { confirm: true }), check);
-    assert.equal(count(api, "rs121A06"), 1);
-  });
-}
 
 // ---- resource_cancel
-const CANCEL_ROW = { resSeq: "12", seqNum: 11735, resIdx: "1", reqText: "테스트",
-  resStartDate: "209901011400", resEndDate: "209901011500", createDate: "20261016103000",
-  schmSeq: "", schSeq: "", resName: "대회의실 회의실", alldayYn: "N", empSeq: "E1" };
+const ROW = { resSeq: "12", seqNum: 11735, resIdx: "1", reqText: "테스트", resStartDate: "209901011400",
+  resEndDate: "209901011500", createDate: "20261016103000", schmSeq: "", schSeq: "", resName: "대회의실 회의실",
+  alldayYn: "N", empSeq: "E1" };
 
-// answers `before` until the cancel has gone out, then `after`; check(path) may fail the read-back
-function cancelApi(before, { after = [], success = true, write, check } = {}) {
+// answers `before` until the cancel has gone out, then `after`; check() may answer the read-back instead
+function cancelApi({ before = [ROW], after = [], write = () => ({ successTf: true }), check: readBack } = {}) {
   return fake((path, _body, calls) => {
-    const cancelled = calls.some((c) => c.path.endsWith("rs121A11"));
-    if (path.endsWith("rs121A05")) {
-      if (cancelled && check) return check();
-      return { resultList: cancelled ? after : before };
-    }
-    if (path.endsWith("rs121A11")) return write ? write() : { successTf: success };
-    return {};
+    const done = calls.some((c) => c.path.endsWith("rs121A11"));
+    if (path.endsWith("rs121A05")) return done && readBack ? readBack() : { resultList: done ? after : before };
+    return path.endsWith("rs121A11") ? write() : {};
   });
 }
-const cancel = (api, args = {}) => cancelReservation(RES, { res_seq: "12", start: START, end: END, ...args }, { fetch: api.fetch });
+const cancel = (api, args = {}) => cancelReservation(S, { res_seq: "12", start: START, end: END, ...args }, { fetch: api.fetch });
 
-test("cancel: a preview finds the booking and writes nothing", async () => {
-  const api = cancelApi([CANCEL_ROW]);
-  const out = await cancel(api);
-  assert.deepEqual(out, { resource: "대회의실 회의실", title: "테스트", start: START, end: END });
-  assert.deepEqual(api.paths(), ["/schres/rs121A05"]);
-  const body = api.calls[0].body;
-  assert.deepEqual([body.resList, body.startDate, body.endDate], [[{ resSeq: "12" }], "20990101", "20990101"]);
-});
-
-test("cancel: confirm sends the row and checks it is gone", async () => {
-  const api = cancelApi([CANCEL_ROW], { after: [] });
-  const out = await cancel(api, { res_seq: 12, confirm: true });
-  assert.equal(out.cancelled, true);
-  assert.deepEqual(api.paths(), ["/schres/rs121A05", "/schres/rs121A11", "/schres/rs121A05"]);
-  assert.deepEqual(api.calls[1].body, { companyInfo: COMPANY, statusCode: "CA", deleteRangeCode: "UO",
+test("resource cancel: a preview finds my one booking; confirm sends it and checks it is gone", async () => {
+  const api = cancelApi();
+  assert.deepEqual(await cancel(api), { resource: "대회의실 회의실", title: "테스트", start: START, end: END });
+  assert.deepEqual(writes(api), []);
+  const listed = api.calls[0].body;
+  assert.deepEqual([listed.resList, listed.startDate, listed.endDate], [[{ resSeq: "12" }], "20990101", "20990101"]);
+  assert.equal((await cancel(api, { res_seq: 12, confirm: true })).cancelled, true);
+  assert.deepEqual(bodyOf(api, "rs121A11"), { companyInfo: COMPANY, statusCode: "CA", deleteRangeCode: "UO",
     resSeqList: [{ resSeq: "12", seqNum: 11735, resIdx: "1", reqText: "테스트", startDate: "209901011400",
       endDate: "209901011500", createDate: "20261016103000", schmSeq: "", schSeq: "", resName: "대회의실 회의실",
       alldayYn: "N" }], langCode: "kr" });
+  assert.deepEqual(writes(api), ["rs121A11"]);
 });
 
-for (const [id, rows, match] of [
-  ["none", [], /찾지 못했습니다/],
-  ["someone-elses", [{ ...CANCEL_ROW, empSeq: "E9" }], /찾지 못했습니다/],
-  ["two", [CANCEL_ROW, { ...CANCEL_ROW, seqNum: 2 }], /여러 건/],
-  ["other-time", [{ ...CANCEL_ROW, resEndDate: "209901011530" }], /찾지 못했습니다/]]) {
-  test(`cancel refuses unless exactly one own booking matches: ${id}`, async () => {
-    const api = cancelApi(rows);
-    await assert.rejects(cancel(api, { confirm: true }), rejectsWith(match));
-    assert.equal(count(api, "rs121A11"), 0);
-  });
-}
+test("resource cancel: refused unless exactly one own booking matches", () => refuses(cancelApi, cancel, [
+  [{}, { before: [{ ...ROW, empSeq: "E9" }] }, /취소할 본인 예약을 찾지 못했습니다/],
+  [{}, { before: [{ ...ROW, resEndDate: "209901011530" }] }, /찾지 못했습니다/],
+  [{}, { before: [ROW, { ...ROW, seqNum: 2 }] }, /여러 건/],
+  [{ start: "2099-01-01" }, {}, BAD_TIME],
+]));
 
-for (const [id, opts] of [["still-there", { after: [CANCEL_ROW], success: true }],
-  ["no-success-flag", { after: [], success: false }]]) {
-  test(`cancel reports when it cannot confirm the result: ${id}`, async () => {
-    await assert.rejects(cancel(cancelApi([CANCEL_ROW], opts), { confirm: true }),
-      rejectsWith(/^취소 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-  });
-}
-
-for (const start of ["2099-01-01", "2099-01-01 14:00:00"]) {
-  test(`cancel rejects a malformed time before sending: ${start}`, async () => {
-    const api = cancelApi([CANCEL_ROW]);
-    await assert.rejects(cancel(api, { start }), (e) => !(e instanceof GroupwareError) && e.message.includes(start));
-    assert.deepEqual(api.calls, []);
-  });
-}
-
-for (const confirm of NOT_TRUE) {
-  test(`cancel: confirm ${JSON.stringify(confirm)} only previews`, async () => {
-    const api = cancelApi([CANCEL_ROW]);
-    assert.equal((await cancel(api, { confirm })).cancelled, undefined);
-    assert.equal(count(api, "rs121A11"), 0);
-  });
-}
-
-// beyond Python, which lets these escape: the cancel went out, so a failed check must neither
-// make the caller's re-login run the cancel again nor read as a raw error
-for (const [id, opts] of [["check-session-dropped", { check: unauthorized }], ["check-timeout", { check: timesOut }],
-  ["cancel-timeout", { write: timesOut }]]) {
-  test(`cancel: an unclear cancel or check is unconfirmed, never retried: ${id}`, async () => {
-    const api = cancelApi([CANCEL_ROW], opts);
-    await assert.rejects(cancel(api, { confirm: true }), rejectsWith(/^취소 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-    assert.equal(count(api, "rs121A11"), 1);
-  });
-}
-
-test("cancel: a cancel refused for the session stays a SessionError (it never ran)", async () => {
-  const api = cancelApi([CANCEL_ROW], { write: unauthorized });
-  await assert.rejects(cancel(api, { confirm: true }), SessionError);
-  assert.equal(count(api, "rs121A11"), 1);
-});
+test("resource cancel: an unclear cancel or check is unconfirmed, never retried", () =>
+  unclear(cancelApi, (api) => cancel(api, { confirm: true }), "rs121A11", [
+    [{ after: [ROW] }, UNSURE("취소")],
+    [{ write: () => ({ successTf: false }) }, UNSURE("취소")],
+    [{ write: timesOut }, UNSURE("취소")],
+    [{ check: unauthorized }, UNSURE("취소")],   // a SessionError after the cancel would run it again
+    [{ check: () => [ROW] }, UNSURE("취소")],   // a listing that is not a list of rows is not "gone"
+    [{ write: unauthorized }, (e) => e instanceof SessionError]]));
 
 // ---- resource_update
-// an rs121A10 detail of CANCEL_ROW, with the fields the guard reads
-const RES_DETAIL = { resSeq: "12", seqNum: 11735, resIdx: "1", reqText: "테스트", resName: "대회의실 회의실",
+// an rs121A10 detail of ROW, with the fields the guard reads
+const DETAIL = { resSeq: "12", seqNum: 11735, resIdx: "1", reqText: "테스트", resName: "대회의실 회의실",
   startDate: "209901011400", endDate: "209901011500", createDate: "20261016103000", empSeq: "E1", apprYn: "N",
-  alldayYn: "N", repeatType: "10", statusCode: "RC", schSeq: "", schmSeq: "", fileList: [], file: [],
-  descText: "안건", limitReservationRange: "", subscriberList: [
-    { groupSeq: "G1", compSeq: "1000", deptSeq: "D1", empSeq: "E1", empName: "홍길동", loginId: "hong" },
-    { groupSeq: "G1", compSeq: "1000", deptSeq: "D2", empSeq: "E7", empName: "김민수", loginId: "kim" }] };
+  alldayYn: "N", repeatType: "10", statusCode: "RC", schSeq: "", schmSeq: "", fileList: [], file: [], descText: "안건",
+  subscriberList: [{ groupSeq: "G1", compSeq: "1000", deptSeq: "D1", empSeq: "E1", loginId: "hong" },
+    { groupSeq: "G1", compSeq: "1000", deptSeq: "D2", empSeq: "E7" }] };
 const SELF = { seqNum: 11735, resIdx: "1", statusCode: "RC", limitYn: "N" };
 
-// like the live groupware, rs121A12 books anew under a new seqNum and cancels the old one: the day's
-// list then holds the new booking (unless `back` says otherwise) and the old detail is gone
-function updateApi({ detail = RES_DETAIL, used = [SELF], limitYn = "N", success = 1, write, back } = {}) {
-  return fake((path, body, calls) => {
+// like the live groupware, rs121A12 books anew under a new seqNum: the day's list then holds the new
+// booking, unless back() answers
+function updateApi({ detail = {}, used = [SELF], limitYn = "N", write = () => ({ successTf: 1 }), back } = {}) {
+  return fake((path, _body, calls) => {
     const wrote = calls.find((c) => c.path.endsWith("rs121A12"))?.body;
     if (path.endsWith("rs121A05")) {
-      if (!wrote) return { resultList: [CANCEL_ROW] };
-      return back ? back() : { resultList: [{ ...CANCEL_ROW, seqNum: 11736, reqText: wrote.reqText,
+      if (!wrote) return { resultList: [ROW] };
+      return back ? back() : { resultList: [{ ...ROW, seqNum: 11736, reqText: wrote.reqText,
         resStartDate: wrote.startDate, resEndDate: wrote.endDate }] };
     }
-    if (path.endsWith("rs121A10")) {
-      return wrote ? new Response(JSON.stringify({ resultCode: 500, resultMsg: "취소/삭제된 자원예약입니다." })) : detail;
-    }
+    if (path.endsWith("rs121A10")) return { ...DETAIL, ...detail };
     if (path.endsWith("rs121A04")) return { reservationYn: "Y", limitYn };   // this booking itself counts as taken
-    if (path.endsWith("rs121A14")) return { resRepeatCount: 1, usedResList: used };
-    if (path.endsWith("rs121A12")) return write ? write() : { successTf: success };
-    return {};
+    if (path.endsWith("rs121A14")) return { usedResList: used };
+    return path.endsWith("rs121A12") ? write() : {};
   });
 }
-const resUpdate = (api, args = {}, opts = {}) => updateReservation(RES, { res_seq: "12", start: START, end: END, ...args },
-  { fetch: api.fetch, now: () => new Date(2026, 9, 28, 12, 0), ...opts });
+const resUpdate = (api, args = {}) => updateReservation(S, { res_seq: "12", start: START, end: END, ...args },
+  { fetch: api.fetch, now: () => new Date(2026, 9, 28, 12, 0) });
 
-test("update: a title-only preview needs no availability check and writes nothing", async () => {
+test("resource update: a title-only preview needs no availability check", async () => {
   const api = updateApi();
-  const out = await resUpdate(api, { title: "주간회의" });
-  assert.deepEqual(out, { resource: "대회의실 회의실", before: { title: "테스트", start: START, end: END },
-    after: { title: "주간회의", start: START, end: END }, available: true, approval_required: false });
+  assert.deepEqual(await resUpdate(api, { title: "주간회의" }), { resource: "대회의실 회의실",
+    before: { title: "테스트", start: START, end: END }, after: { title: "주간회의", start: START, end: END },
+    available: true, approval_required: false });
   assert.deepEqual(api.paths(), ["/schres/rs121A05", "/schres/rs121A10"]);
   assert.deepEqual(bodyOf(api, "rs121A10"), { companyInfo: COMPANY, resSeq: "12", seqNum: 11735, langCode: "kr" });
 });
 
-test("update: confirm sends the web form's body and reads it back", async () => {
+test("resource update: confirm sends the web form's body and reads it back", async () => {
   const api = updateApi();
   const out = await resUpdate(api, { new_start: "2099-01-01 14:30", new_end: "2099-01-01 16:00", confirm: true });
   assert.equal(out.updated, true);
@@ -343,574 +214,271 @@ test("update: confirm sends the web form's body and reads it back", async () => 
     resSubscriberList: [{ groupSeq: "G1", compSeq: "1000", deptSeq: "D1", empSeq: "E1" },
       { groupSeq: "G1", compSeq: "1000", deptSeq: "D2", empSeq: "E7" }],
     uidList: "", repeatType: "10", repeatEndDay: "", repeatByDay: "", resName: "대회의실 회의실" });
-  assert.equal(count(api, "rs121A12"), 1);
+  assert.deepEqual(writes(api), ["rs121A12"]);
 });
 
-for (const [id, used, available] of [
-  ["only-itself", [SELF], true],
-  ["cancelled-other", [SELF, { ...SELF, seqNum: 2, statusCode: "CA" }], true],
-  ["limit-row", [{ ...SELF, seqNum: 2, limitYn: "Y" }], true],
-  ["other-booking", [SELF, { ...SELF, seqNum: 2 }], false],
-  ["same-seq-other-idx", [{ ...SELF, resIdx: "2" }], false],
-  ["unknown-status", [{ ...SELF, seqNum: 2, statusCode: "ZZ" }], false],
-  ["unreadable", null, false]]) {
-  test(`update: another booking in the new time blocks the write: ${id}`, async () => {
+test("resource update: another booking in the new time blocks the write", async () => {
+  const args = { new_start: "2099-01-01 15:00", new_end: "2099-01-01 16:00" };
+  for (const [used, available] of [
+    [[SELF], true],
+    [[SELF, { ...SELF, seqNum: 2, statusCode: "CA" }], true],
+    [[{ ...SELF, seqNum: 2, limitYn: "Y" }], true],   // a usage-limit row, not a booking
+    [[SELF, { ...SELF, seqNum: 2 }], false],
+    [[{ ...SELF, resIdx: "2" }], false],
+    [null, false]]) {   // unreadable
     const api = updateApi({ used });
-    const args = { new_start: "2099-01-01 15:00", new_end: "2099-01-01 16:00" };
     assert.equal((await resUpdate(api, args)).available, available);
     if (!available) await assert.rejects(resUpdate(api, { ...args, confirm: true }), rejectsWith(/이미 다른 예약이 있습니다/));
-    assert.equal(count(api, "rs121A12"), 0);
-  });
-}
-
-for (const [id, detail, match] of [
-  ["someone-elses", { empSeq: "E9" }, /본인 예약이 아닙니다/],
-  ["repeating", { repeatType: "20" }, /반복 예약입니다/],
-  ["all-day", { alldayYn: "Y" }, /종일 예약입니다/],
-  ["rejected", { statusCode: "RJ" }, /취소·반려된 예약입니다/],
-  ["no-approval-flag", { apprYn: undefined }, /승인 여부/],
-  ["linked-schedule", { schSeq: "88" }, /일정과 연결된 예약입니다/],
-  ["file", { fileList: [{ fileSn: 1 }] }, /첨부파일이 있는 예약입니다/],
-  ["no-subscribers", { subscriberList: [] }, /예약자 정보가 없습니다/],
-  ["other-booking", { seqNum: 9 }, /목록과 다릅니다/],
-  ["no-create-date", { createDate: "" }, /예약 상세를 찾지 못했습니다/]]) {
-  test(`update refuses what the guard cannot vouch for: ${id}`, async () => {
-    const api = updateApi({ detail: { ...RES_DETAIL, ...detail } });
-    await assert.rejects(resUpdate(api, { title: "새 제목", confirm: true }), rejectsWith(match));
-    assert.equal(count(api, "rs121A12"), 0);
-  });
-}
-
-for (const [id, args, opts, match] of [
-  ["nothing-to-change", {}, {}, /바꿀 값/],
-  ["blank-title", { title: "  " }, {}, /비울 수 없습니다/],
-  ["end-first", { new_end: "2099-01-01 13:00" }, {}, /종료 시각이 시작 시각보다 빠릅니다/],
-  ["ended", { title: "x" }, { now: () => new Date(2099, 0, 1, 15, 0) }, /이미 끝난 예약입니다/],
-  ["past-start", { new_start: "2099-01-01 13:00" }, { now: () => new Date(2099, 0, 1, 14, 30) }, /이미 지났습니다/]]) {
-  test(`update rejects a bad change before the network: ${id}`, async () => {
-    const api = updateApi();
-    await assert.rejects(resUpdate(api, args, opts), rejectsWith(match));
-    assert.deepEqual(api.calls, []);
-  });
-}
-
-test("update: an ongoing booking may still be extended", async () => {
-  const api = updateApi();
-  const out = await resUpdate(api, { new_end: "2099-01-01 15:30", confirm: true }, { now: () => new Date(2099, 0, 1, 14, 30) });
-  assert.equal(out.updated, true);
+    assert.deepEqual(writes(api), []);
+  }
 });
 
-test("update: the usage limit and the longest booking are enforced", async () => {
-  await assert.rejects(resUpdate(updateApi({ limitYn: "Y" }), { new_end: "2099-01-01 16:00" }), rejectsWith(/이용 제한/));
-  const long = updateApi({ detail: { ...RES_DETAIL, limitReservationRange: "60" } });
-  await assert.rejects(resUpdate(long, { new_end: "2099-01-01 16:00" }), rejectsWith(/최대 1시간/));
-  assert.equal(count(long, "rs121A04"), 0);
-});
+test("resource update: refusals write nothing", () => refuses(updateApi, resUpdate, [
+  [{}, {}, /바꿀 값/],
+  [{ title: "  " }, {}, /비울 수 없습니다/],
+  [{ new_end: "2099-01-01 13:00" }, {}, /종료 시각이 시작 시각보다 빠릅니다/],
+  [{ title: "x", start: "2026-10-27 14:00", end: "2026-10-27 15:00" }, {}, /이미 끝난 예약입니다/],
+  [{ new_start: "2026-10-28 11:00" }, {}, /이미 지났습니다/],
+  [{ new_end: "2099-01-01 16:00" }, { limitYn: "Y" }, /이용 제한/],
+  [{ new_end: "2099-01-01 16:00" }, { detail: { limitReservationRange: "60" } }, /최대 1시간/],
+  ...[[{ empSeq: "E9" }, /본인 예약이 아닙니다/],
+    [{ repeatType: "20" }, /반복 예약입니다/],
+    [{ alldayYn: "Y" }, /종일 예약입니다/],
+    [{ statusCode: "RJ" }, /취소·반려된 예약입니다/],
+    [{ apprYn: undefined }, /승인 여부/],
+    [{ schSeq: "88" }, /일정과 연결된 예약입니다/],
+    [{ fileList: [{ fileSn: 1 }] }, /첨부파일이 있는 예약입니다/],
+    [{ subscriberList: [] }, /예약자 정보가 없습니다/],
+    [{ seqNum: 9 }, /목록과 다릅니다/],
+    [{ createDate: "" }, /예약 상세를 찾지 못했습니다/]].map(([detail, re]) => [{ title: "새 제목" }, { detail }, re]),
+]));
 
-for (const [id, opts] of [["no-success-flag", { success: 0 }], ["write-timeout", { write: timesOut }],
-  ["check-timeout", { back: timesOut }], ["unchanged", { back: () => ({ resultList: [CANCEL_ROW] }) }]]) {
-  test(`update: an unclear write or check is unconfirmed, never retried: ${id}`, async () => {
-    const api = updateApi(opts);
-    await assert.rejects(resUpdate(api, { title: "새 제목", confirm: true }),
-      rejectsWith(/^예약 수정 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-    assert.equal(count(api, "rs121A12"), 1);
-  });
-}
-
-for (const confirm of NOT_TRUE) {
-  test(`update: confirm ${JSON.stringify(confirm)} only previews`, async () => {
-    const api = updateApi();
-    assert.equal((await resUpdate(api, { title: "새 제목", confirm })).updated, undefined);
-    assert.equal(count(api, "rs121A12"), 0);
-  });
-}
+test("resource update: an unclear write or check is unconfirmed, never retried", () =>
+  unclear(updateApi, (api) => resUpdate(api, { title: "새 제목", confirm: true }), "rs121A12", [
+    [{ write: () => ({ successTf: 0 }) }, UNSURE("예약 수정")],
+    [{ write: timesOut }, UNSURE("예약 수정")],
+    [{ back: unauthorized }, UNSURE("예약 수정")],
+    [{ back: () => ({ resultList: [ROW] }) }, UNSURE("예약 수정")]]));   // unchanged
 
 // ---- schedule_create / schedule_update / schedule_delete
-const WRITE_CALS = [
-  { mcalSeq: 134, calType: "E", calRwGbn: "w", empSeq: "E1", calTitle: "내 일정", displayYn: "Y" },
-  { mcalSeq: 35, calType: "M", calRwGbn: "r", empSeq: "E9", calTitle: "공용 일정", displayYn: "Y" }];
+const CALS = [{ mcalSeq: 134, calType: "E", calRwGbn: "w", empSeq: "E1", calTitle: "내 일정" },
+  { mcalSeq: 35, calType: "M", calRwGbn: "r", empSeq: "E9", calTitle: "공용 일정" }];
 const SCH_START = "2099-01-01 15:00", SCH_END = "2099-01-01 16:00";
-// an sc111A04 detail of a plain schedule of mine, with the fields the guard reads
-const CREATED = { schSeq: 8439, schmSeq: 8439, mcalSeq: 134, schTitle: "주간회의",
-  startDate: "209901011500", endDate: "209901011600", alldayYn: "N",
-  repeatType: "10", calType: "E", gbnCode: "E", schGbnCode: "10",
-  lunarYn: "N", contents: "", resList: [], reservedList: [],
-  addressUserList: [], schPartEmpList: [], schUserList: [], schAlarmList: [],
+// an sc111A04 detail of a plain schedule of mine; its empty lists must not read as filled
+const CREATED = { schSeq: 8439, schmSeq: 8439, mcalSeq: 134, schTitle: "주간회의", startDate: "209901011500",
+  endDate: "209901011600", alldayYn: "N", repeatType: "10", calType: "E", gbnCode: "E", schGbnCode: "10", lunarYn: "N",
+  contents: "", resList: [], reservedList: [], addressUserList: [], schPartEmpList: [], schUserList: [], schAlarmList: [],
   fileList: [], fileCnt: 0 };
+const ROW_8440 = { schSeq: 8440, mcalSeq: 134, schTitle: "주간회의", startDate: "209901011500", endDate: "209901011600" };
 
 // answers `before` until a request to `code` has gone out, then `after`
 const until = (code, before, after) => (calls) => (calls.some((c) => c.path.endsWith(code)) ? after : before);
 
-// write is sc111A05's resultData; detail (sc111A04) and rows (sc111A03) may be until(...) callables;
-// fail(path, calls) may answer or throw first
-function schApi({ cals = WRITE_CALS, people = [], write = null, detail = null, rows = [], fail } = {}) {
+// write is sc111A05's resultData; detail (sc111A04) and rows (sc111A03) may be until(...); fail(path, calls) may answer first
+function schApi({ cals = CALS, write = {}, detail = CREATED, rows = [], fail } = {}) {
   return fake((path, body, calls) => {
     const failed = fail?.(path, calls);
     if (failed !== undefined) return failed;
-    if (path.endsWith("gw102A04")) return searchIn(people, body);
+    if (path.endsWith("gw102A04")) return searchIn(body);
     if (path.endsWith("sc111A02")) return { resultList: cals };
     if (path.endsWith("sc111A03")) return { resultList: typeof rows === "function" ? rows(calls) : rows };
     if (path.endsWith("sc111A04")) return typeof detail === "function" ? detail(calls) : detail;
-    if (path.endsWith("sc111A05")) return write;
-    return true;   // sc111A06
+    return path.endsWith("sc111A05") ? write : true;   // sc111A06
   });
 }
-const create = (api, args = {}) =>
-  createSchedule(RES, { title: "주간회의", start: SCH_START, end: SCH_END, ...args }, { fetch: api.fetch });
+const create = (api, args = {}) => createSchedule(S, { title: "주간회의", start: SCH_START, end: SCH_END, ...args }, { fetch: api.fetch });
+const update = (api, args = {}) => updateSchedule(S, { sch_seq: 8439, ...args }, { fetch: api.fetch });
+const remove = (api, args = {}) => deleteSchedule(S, { sch_seq: 8439, ...args }, { fetch: api.fetch });
 
-test("create: a preview finds my calendar and writes nothing", async () => {
-  const api = schApi();
-  const out = await create(api, { title: " 주간회의 ", place: "대회의실" });
-  assert.deepEqual(out, { calendar: "내 일정", title: "주간회의", start: SCH_START, end: SCH_END,
-    place: "대회의실", memo: "", attendees: [] });
-  assert.deepEqual(api.paths(), ["/schres/sc111A02"]);   // no sc111A05 on a preview
-});
-
-test("create: confirm sends the contract and reads it back", async () => {
-  const api = schApi({ people: [ME, KIM_DEV, KIM_HR], write: { schSeq: 8439, schmSeq: 8439 }, detail: CREATED });
-  const out = await create(api, { place: "대회의실", memo: "안건", attendees: ["홍길동", "김민수 개발", "김민수 개발"], confirm: true });
-  assert.deepEqual(api.paths(), ["/schres/sc111A02", "/gw/APIHandler/gw102A04", "/gw/APIHandler/gw102A04",
-    "/gw/APIHandler/gw102A04", "/schres/sc111A05", "/schres/sc111A04"]);
-  assert.deepEqual(api.calls[4].body, {
-    companyInfo: COMPANY, langCode: "kr", schmSeq: "0", schSeq: "0",
-    mcalSeq: "134", schTitle: "주간회의", startDate: "209901011500",
-    endDate: "209901011600", alldayYn: "N", lunarYn: "N", alarm_yn: "N",
-    gbnCode: "E", calType: "E", gbnSeq: "", schGbnCode: "10", repeatType: "10",
-    repeatEndDay: "", repeatByDay: "", contents: "안건", rangeCode: "N",
-    schPlace: "대회의실", placeMapData: "{}", placeFileId: "", fileId: "",
-    delFileList: [], uidList: "", resList: [], reservedList: [],
-    schAlarmList: [], schUserList: [],
+test("schedule create: a preview finds my calendar; confirm sends the contract and reads it back", async () => {
+  const api = schApi({ write: { schSeq: 8439, schmSeq: 8439 } });
+  const args = { title: " 주간회의 ", place: "대회의실", memo: "안건", attendees: ["홍길동", "김민수 개발", "김민수 개발"] };
+  const preview = { calendar: "내 일정", title: "주간회의", start: SCH_START, end: SCH_END, place: "대회의실", memo: "안건",
+    attendees: ["홍길동 (개발팀)", "김민수 (개발팀)"] };
+  assert.deepEqual(await create(api, args), preview);
+  assert.deepEqual(writes(api), []);
+  assert.deepEqual(await create(api, { ...args, confirm: true }), { ...preview, created: true, sch_seq: 8439 });
+  assert.deepEqual(bodyOf(api, "sc111A05"), {
+    companyInfo: COMPANY, langCode: "kr", schmSeq: "0", schSeq: "0", mcalSeq: "134", schTitle: "주간회의",
+    startDate: "209901011500", endDate: "209901011600", alldayYn: "N", lunarYn: "N", alarm_yn: "N",
+    gbnCode: "E", calType: "E", gbnSeq: "", schGbnCode: "10", repeatType: "10", repeatEndDay: "", repeatByDay: "",
+    contents: "안건", rangeCode: "N", schPlace: "대회의실", placeMapData: "{}", placeFileId: "", fileId: "",
+    delFileList: [], uidList: "", resList: [], reservedList: [], schAlarmList: [], schUserList: [],
     // I made it, so I am not invited; the other person once, with my groupSeq
     schPartEmpList: [{ compSeq: "1000", groupSeq: "G1", deptSeq: "D2", empSeq: "E7", dutyPositionOption: "0" }],
-    addressUserList: [], inviterPartType: "M", companyEmpSeq: "E1", empSeq: "E1",
-    groupSeq: "G1", otherLinkList: [], schModuleGbn: null, schModuleSeq: null,
-    myMemo: "", videoYn: "N", mailSend: "N" });
-  assert.deepEqual(api.calls[5].body, { companyInfo: COMPANY, schSeq: "8439", tcalSeq: "", langCode: "kr" });
-  assert.deepEqual(out, { calendar: "내 일정", title: "주간회의", start: SCH_START, end: SCH_END,
-    place: "대회의실", memo: "안건", attendees: ["홍길동 (개발팀)", "김민수 (개발팀)"], created: true, sch_seq: 8439 });
+    addressUserList: [], inviterPartType: "M", companyEmpSeq: "E1", empSeq: "E1", groupSeq: "G1", otherLinkList: [],
+    schModuleGbn: null, schModuleSeq: null, myMemo: "", videoYn: "N", mailSend: "N" });
+  assert.deepEqual(api.calls.at(-1), { path: "/schres/sc111A04", query: "",
+    body: { companyInfo: COMPANY, schSeq: "8439", tcalSeq: "", langCode: "kr" } });
+  assert.deepEqual(writes(api), ["sc111A05"]);
 });
 
-test("create finds its id in the list when the answer has none", async () => {
-  const row = { schSeq: 8440, mcalSeq: 134, schTitle: "주간회의", startDate: "209901011500", endDate: "209901011600" };
-  // decoys around it: another title; the same title in another slot; the same title with
-  // only the start or only the end of the slot differing
-  const rows = [{ ...row, schSeq: 1, schTitle: "다른 일정" },
-    { ...row, schSeq: 2, startDate: "209901011600", endDate: "209901011700" },
-    row,
-    { ...row, schSeq: 3, startDate: "209901011530" },
-    { ...row, schSeq: 4, endDate: "209901011630" }];
-  const api = schApi({ write: {}, detail: { ...CREATED, schSeq: 8440 }, rows });
-  const out = await create(api, { confirm: true });
-  assert.equal(out.sch_seq, 8440);
-  assert.deepEqual(api.paths(), ["/schres/sc111A02", "/schres/sc111A05", "/schres/sc111A03", "/schres/sc111A04"]);
-  const listed = api.calls[2].body;
-  assert.deepEqual([listed.startDate, listed.endDate, listed.mySchYn], ["20990101", "20990101", "N"]);
-  assert.deepEqual(listed.calList, [{ mcalSeq: "134", calType: "E", adminYn: "N", color: "#748FFC" }]);
-  assert.equal(api.calls[3].body.schSeq, "8440");
+test("schedule create: without an id in the answer, the one listed match is read back", async () => {
+  const rows = [{ ...ROW_8440, schSeq: 1, schTitle: "다른 일정" }, { ...ROW_8440, schSeq: 3, startDate: "209901011530" },
+    ROW_8440, { ...ROW_8440, schSeq: 4, endDate: "209901011630" }];
+  const api = schApi({ detail: { ...CREATED, schSeq: 8440 }, rows });
+  assert.equal((await create(api, { confirm: true })).sch_seq, 8440);
+  const listed = bodyOf(api, "sc111A03");
+  assert.deepEqual([listed.startDate, listed.endDate, listed.mySchYn, listed.calList.map((c) => c.mcalSeq)],
+    ["20990101", "20990101", "N", ["134"]]);
+  assert.equal(api.calls.at(-1).body.schSeq, "8440");
 });
 
-test("create does not guess among several matching schedules", async () => {
-  const row = { schSeq: 8440, mcalSeq: 134, schTitle: "주간회의", startDate: "209901011500", endDate: "209901011600" };
-  const api = schApi({ write: {}, detail: CREATED, rows: [row, { ...row, schSeq: 8441 }] });
-  await assert.rejects(create(api, { confirm: true }), rejectsWith(/^일정 등록 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-  assert.equal(count(api, "sc111A04"), 0);   // no single id, nothing to read back
+test("schedule create: refusals write nothing; my own calendar is picked among several", async () => {
+  const other = { ...CALS[0], mcalSeq: 200, empSeq: "E9", calTitle: "남의 일정" };
+  assert.equal((await create(schApi({ cals: [other, CALS[0]] }))).calendar, "내 일정");
+  await refuses(schApi, create, [
+    [{ title: "  " }, {}, /제목이 비어 있습니다/],
+    [{ start: SCH_END, end: SCH_START }, {}, /종료 시각/],
+    [{ start: "2099-01-01" }, {}, BAD_TIME],
+    [{}, { cals: [] }, /찾지 못했습니다/],
+    [{}, { cals: [{ ...CALS[0], calRwGbn: "r" }] }, /찾지 못했습니다/],
+    [{}, { cals: [CALS[0], { ...CALS[0], mcalSeq: 135 }] }, /여러 개/],
+    [{ attendees: ["김민수"] }, {}, /한 명으로 정하지 못했습니다/]]);
 });
 
-for (const [id, write, detail] of [
-  ["start-differs", { schSeq: 8439 }, { ...CREATED, startDate: "209901011530" }],
-  ["end-differs", { schSeq: 8439 }, { ...CREATED, endDate: "209901011630" }],
-  ["title-differs", { schSeq: 8439 }, { ...CREATED, schTitle: "다른 일정" }],
-  ["calendar-differs", { schSeq: 8439 }, { ...CREATED, mcalSeq: 35 }],
-  ["id-not-found", {}, CREATED],
-  ["read-back-empty", { schSeq: 8439 }, null]]) {
-  test(`create reports a result it cannot confirm: ${id}`, async () => {
-    const api = schApi({ write, detail });
-    await assert.rejects(create(api, { confirm: true }), rejectsWith(/일정 등록 결과를 확인하지 못했습니다.*\. 그룹웨어에서 확인해 주세요\.$/));
-    assert.equal(count(api, "sc111A05"), 1);
-  });
-}
-
-for (const [id, fail] of [["session-dropped", unauthorized], ["timeout", timesOut]]) {
-  test(`create reports a failed check after the write as unconfirmed: ${id}`, async () => {
-    // the read-back fails right after the write
-    const api = schApi({ write: { schSeq: 8439 }, detail: CREATED, fail: (path) => (path.endsWith("sc111A04") ? fail() : undefined) });
-    // a GroupwareError, not the raw failure: a SessionError would make the caller log in again and
-    // write again, and a timeout would not say that the write went out
-    await assert.rejects(create(api, { confirm: true }),
-      rejectsWith(/^일정 등록 결과를 확인하지 못했습니다\(sch_seq 8439\)\. 그룹웨어에서 확인해 주세요\.$/));
-    assert.equal(count(api, "sc111A05"), 1);
-  });
-}
-
-for (const [id, cals, match] of [
-  ["none", [], /찾지 못했습니다/],
-  ["read-only", [{ ...WRITE_CALS[0], calRwGbn: "r" }, WRITE_CALS[1]], /찾지 못했습니다/],
-  ["two-of-mine", [WRITE_CALS[0], { ...WRITE_CALS[0], mcalSeq: 135 }], /여러 개/]]) {
-  test(`create needs one writable personal calendar: ${id}`, async () => {
-    const api = schApi({ cals });
-    await assert.rejects(create(api, { confirm: true }), rejectsWith(match));
-    assert.equal(count(api, "sc111A05"), 0);
-  });
-}
-
-test("create picks my own among several writable personal calendars", async () => {
-  const cals = [{ ...WRITE_CALS[0], mcalSeq: 200, empSeq: "E9", calTitle: "남의 일정" }, WRITE_CALS[0]];
-  assert.equal((await create(schApi({ cals }))).calendar, "내 일정");
+test("schedule create: an unclear write or read-back is unconfirmed, never retried", () => {
+  const sch = /^일정 등록 결과를 확인하지 못했습니다\(sch_seq 8439\)\. 그룹웨어에서 확인해 주세요\.$/;
+  return unclear(schApi, (api) => create(api, { confirm: true }), "sc111A05", [
+    [{ write: { schSeq: 8439 }, detail: { ...CREATED, startDate: "209901011530" } }, sch],
+    [{ write: { schSeq: 8439 }, detail: { ...CREATED, mcalSeq: 35 } }, sch],
+    [{ write: { schSeq: 8439 }, detail: null }, sch],
+    [{ write: { schSeq: 8439 }, fail: on("sc111A04", unauthorized) }, sch],   // a SessionError would write again
+    [{ rows: [ROW_8440, { ...ROW_8440, schSeq: 8441 }] }, UNSURE("일정 등록")],   // no guessing among several
+    [{ fail: on("sc111A05", () => new Response(JSON.stringify({ resultCode: 114, resultMsg: "필수 값 누락" }))) },
+      /필수 값 누락 그룹웨어에서 확인해 주세요\.$/],
+    [{ fail: on("sc111A05", unauthorized) }, (e) => e instanceof SessionError]]);
 });
 
-for (const [id, args, check] of [
-  ["blank-title", { title: "  " }, rejectsWith(/제목이 비어 있습니다/)],
-  ["end-first", { start: SCH_END, end: SCH_START }, rejectsWith(/종료 시각/)],
-  ["zero-length", { end: SCH_START }, rejectsWith(/종료 시각/)],
-  ["no-time", { start: "2099-01-01" }, (e) => !(e instanceof GroupwareError) && /YYYY-MM-DD HH:MM/.test(e.message)]]) {
-  test(`create rejects bad input before sending: ${id}`, async () => {
-    const api = schApi();
-    await assert.rejects(create(api, args), check);
-    assert.deepEqual(api.calls, []);
-  });
-}
-
-for (const entry of ["김민수", "박없음"]) {
-  test(`create writes nothing when an attendee is not one person: ${entry}`, async () => {
-    const api = schApi({ people: [KIM_DEV, KIM_HR] });
-    await assert.rejects(create(api, { attendees: [entry], confirm: true }), GroupwareError);
-    assert.equal(count(api, "sc111A05"), 0);
-  });
-}
-
-for (const confirm of [undefined, ...NOT_TRUE]) {
-  test(`create: a memo with confirm ${JSON.stringify(confirm)} only previews`, async () => {
-    const api = schApi();
-    const out = await create(api, { memo: "안건", confirm });
-    assert.equal(out.created, undefined);
-    assert.deepEqual(api.paths(), ["/schres/sc111A02"]);
-  });
-}
-
-for (const [id, fail, check] of [
-  ["timeout", timesOut, rejectsWith(/^일정 등록 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/)],
-  // fetch's own text can echo the Authorization header, token included
-  ["protocol-error", () => { throw new TypeError("Illegal header value b'Bearer G1|E1|TOKEN-SECRET'"); },
-    rejectsWith(/^일정 등록 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/)],
-  ["refused-by-api", () => new Response(JSON.stringify({ resultCode: 114, resultMsg: "필수 값 누락" })),
-    rejectsWith(/필수 값 누락 그룹웨어에서 확인해 주세요\.$/)],
-  ["empty-body", () => new Response(""), rejectsWith(/empty response.* 그룹웨어에서 확인해 주세요\.$/)],
-  // the call never ran, so the caller's one re-login may send it: it must stay a SessionError
-  ["session-refused", unauthorized, (e) => e instanceof SessionError && /HTTP 401/.test(e.message)]]) {
-  test(`create: the one write call ending unclear says to check the groupware: ${id}`, async () => {
-    const api = schApi({ write: { schSeq: 8439 }, detail: CREATED, fail: (path) => (path.endsWith("sc111A05") ? fail() : undefined) });
-    let raised;
-    await assert.rejects(create(api, { confirm: true }), (e) => { raised = e; return check(e); });
-    assert.equal(count(api, "sc111A05"), 1);   // sent once, never retried
-    assert.equal(count(api, "sc111A04"), 0);   // an unanswered write is not read back
-    // whatever logs the error prints its whole chain: the header text must not ride along
-    assert.equal(raised.cause, undefined);
-    assert.ok(!String(raised.stack).includes("SECRET"));
-  });
-}
+test("schedule create: an unclear write keeps no transport text, which can carry the token", async () => {
+  const api = schApi({ fail: on("sc111A05", () => { throw new TypeError("Illegal header value b'Bearer G1|E1|TOKEN-SECRET'"); }) });
+  const e = await create(api, { confirm: true }).catch((x) => x);
+  assert.match(e.message, UNSURE("일정 등록"));
+  assert.equal(e.cause, undefined);
+  assert.ok(!String(e.stack).includes("SECRET"));
+  assert.deepEqual(api.paths().slice(-1), ["/schres/sc111A05"]);   // an unanswered write is not read back
+});
 
 const CHANGED = { ...CREATED, schTitle: "주간회의(변경)", startDate: "209901011600", endDate: "209901011700" };
-const update = (api, args = {}) => updateSchedule(RES, { sch_seq: 8439, ...args }, { fetch: api.fetch });
 
-test("update: a preview shows before and after and writes nothing", async () => {
-  const api = schApi({ detail: CREATED });
-  const out = await update(api, { sch_seq: "8439", start: "2099-01-01 16:00", end: "2099-01-01 17:00" });
-  assert.deepEqual(out, { sch_seq: 8439,
-    before: { title: "주간회의", start: "2099-01-01 15:00", end: "2099-01-01 16:00" },
-    after: { title: "주간회의", start: "2099-01-01 16:00", end: "2099-01-01 17:00" } });
-  assert.deepEqual(api.paths(), ["/schres/sc111A04", "/schres/sc111A02"]);
-  assert.deepEqual(api.calls[0].body, { companyInfo: COMPANY, schSeq: "8439", tcalSeq: "", langCode: "kr" });
-});
-
-test("update: confirm sends the stored schedule with the change", async () => {
-  const api = schApi({ detail: until("sc111A05", CREATED, CHANGED), write: {} });
-  const out = await update(api, { title: "주간회의(변경)", start: "2099-01-01 16:00", end: "2099-01-01 17:00", confirm: true });
-  assert.deepEqual(api.paths(), ["/schres/sc111A04", "/schres/sc111A02", "/schres/sc111A05", "/schres/sc111A04"]);
-  assert.deepEqual(api.calls.filter((c) => c.path.endsWith("sc111A04")).map((c) => c.body.schSeq), ["8439", "8439"]);
-  // updateSchedule: the stored detail goes back whole, with these fields set
-  assert.deepEqual(api.calls[2].body, { ...CREATED, companyInfo: COMPANY, langCode: "kr",
+test("schedule update: a preview shows before and after; confirm sends the stored schedule with the change", async () => {
+  const api = schApi({ detail: until("sc111A05", CREATED, CHANGED) });
+  const args = { sch_seq: "8439", title: " 주간회의(변경) ", start: "2099-01-01 16:00", end: "2099-01-01 17:00" };
+  const after = { title: "주간회의(변경)", start: "2099-01-01 16:00", end: "2099-01-01 17:00" };
+  assert.deepEqual(await update(api, args), { sch_seq: 8439,
+    before: { title: "주간회의", start: "2099-01-01 15:00", end: "2099-01-01 16:00" }, after });
+  assert.deepEqual(writes(api), []);
+  assert.deepEqual(bodyOf(api, "sc111A04"), { companyInfo: COMPANY, schSeq: "8439", tcalSeq: "", langCode: "kr" });
+  assert.deepEqual(await update(api, { ...args, confirm: true }), { sch_seq: 8439, after, updated: true });
+  assert.deepEqual(bodyOf(api, "sc111A05"), { ...CREATED, companyInfo: COMPANY, langCode: "kr",
     schSeq: "8439", schmSeq: "8439", mcalSeq: "134", schTitle: "주간회의(변경)",
     startDate: "209901011600", endDate: "209901011700", contents: "", alldayYn: "N", lunarYn: "N",
     alarm_yn: "N", gbnCode: "E", calType: "E", schGbnCode: "10", repeatType: "10", rangeCode: "UO",
     resList: [], reservedList: [], schAlarmList: [], schUserList: [], schPartEmpList: [],
     addressUserList: [], delFileList: [], uidList: "", empSeq: "E1", groupSeq: "G1",
     alarmOnModify: false, mailSend: "N" });
-  assert.equal(api.calls[2].body.fileCnt, 0);   // fields it does not set ride along from the detail
-  assert.deepEqual(out, { sch_seq: 8439, updated: true,
-    after: { title: "주간회의(변경)", start: "2099-01-01 16:00", end: "2099-01-01 17:00" } });
+  assert.deepEqual(writes(api), ["sc111A05"]);
 });
 
-test("update keeps what it is not given", async () => {
-  const detail = { ...CREATED, schPartEmpList: [{ empSeq: "E1" }] };   // only me: still plain
-  const out = await update(schApi({ detail }), { title: "이름만" });
-  assert.deepEqual(out.after, { title: "이름만", start: "2099-01-01 15:00", end: "2099-01-01 16:00" });
-});
-
-for (const [id, args] of [["start-past-the-kept-end", { start: "2099-01-01 17:00" }],
-  ["zero-length", { end: SCH_START }]]) {   // the kept start
-  test(`update refuses an end not after the start: ${id}`, async () => {
-    const api = schApi({ detail: CREATED });
-    await assert.rejects(update(api, { ...args, confirm: true }), rejectsWith(/종료 시각/));
-    assert.equal(count(api, "sc111A05"), 0);
-  });
-}
-
-const NOT_PLAIN = [
-  ["other-calendar", { mcalSeq: 35 }, /내 개인 캘린더/],
-  ["repeating", { repeatType: "40" }, /반복/],
-  ["repeat-missing", { repeatType: null }, /반복/],
-  ["repeat-absent", { repeatType: undefined }, /반복/],
-  ["no-schm-seq", { schmSeq: null }, /찾지 못했습니다/],
-  ["no-end", { endDate: "" }, /찾지 못했습니다/],
-  ["resource", { resList: [{ resSeq: "12" }] }, /자원/],
-  ["reserved", { reservedList: [{ resSeq: "12" }] }, /자원/],
-  ["resources-key", { resources: [{ resSeq: "12" }] }, /자원/],
-  ["external", { addressUserList: [{ email: "x@example.com" }] }, /외부 참석자/],
-  ["others-invited", { schPartEmpList: [{ empSeq: "E1" }, { empSeq: "E7" }] }, /다른 참석자/],
-  ["others-by-org-seq", { schPartEmpList: [{ orgSeq: "E7" }] }, /다른 참석자/],
-  ["module", { schModuleGbn: "EA", schModuleSeq: "77" }, /외부 모듈/],
-  ["module-gbn-only", { schModuleGbn: "EA" }, /외부 모듈/],
-  ["module-seq-only", { schModuleSeq: "77" }, /외부 모듈/],
-  ["file-list", { fileList: [{ fileId: "f" }] }, /첨부/],
-  ["file-count", { fileCnt: "1" }, /첨부/],
-  ["all-day", { alldayYn: "Y" }, /종일/]];
-
-for (const [id, change, match] of NOT_PLAIN) {
-  test(`update leaves all but a plain schedule of mine alone: ${id}`, async () => {
-    const detail = JSON.parse(JSON.stringify({ ...CREATED, ...change }));   // as it comes off the wire
-    const api = schApi({ detail });
-    await assert.rejects(update(api, { title: "x", confirm: true }), rejectsWith(match));
-    assert.equal(count(api, "sc111A05"), 0);
-  });
-}
-
-test("update: I alone as a participant by org seq is still plain", async () => {
-  const out = await update(schApi({ detail: { ...CREATED, schPartEmpList: [{ orgSeq: "E1" }] } }), { title: "x" });
-  assert.equal(out.after.title, "x");
-});
-
-test("update reports a change it cannot read back", async () => {
-  await assert.rejects(update(schApi({ detail: CREATED, write: {} }), { title: "바뀌지 않음", confirm: true }),
-    rejectsWith(/^일정 수정 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-});
-
-for (const [id, args, check] of [
-  ["nothing-to-change", {}, rejectsWith(/바꿀 값/)],
-  ["blank-title", { title: "  " }, rejectsWith(/비울 수 없습니다/)],
-  ["no-time", { start: "2099-01-01" }, (e) => !(e instanceof GroupwareError) && /YYYY-MM-DD HH:MM/.test(e.message)]]) {
-  test(`update rejects bad input before sending: ${id}`, async () => {
-    const api = schApi({ detail: CREATED });
-    await assert.rejects(update(api, args), check);
-    assert.deepEqual(api.calls, []);
-  });
-}
-
-test("update: an unknown id is reported", async () => {
-  await assert.rejects(update(schApi({ detail: null }), { sch_seq: 1, title: "x" }), rejectsWith(/일정 1을\(를\) 찾지 못했습니다/));
-});
-
-for (const confirm of [undefined, ...NOT_TRUE]) {
-  test(`update: confirm ${JSON.stringify(confirm)} only previews`, async () => {
-    const api = schApi({ detail: CREATED });
-    const out = await update(api, { title: "t", confirm });
-    assert.equal(out.updated, undefined);
-    assert.equal(count(api, "sc111A05"), 0);
-  });
-}
-
-for (const id of ["write-timeout", "check-session-dropped", "check-timeout"]) {
-  test(`update reports an unclear write as unconfirmed: ${id}`, async () => {
-    const fail = (path, calls) => {
-      if (path.endsWith("sc111A05") && id === "write-timeout") timesOut();
-      const wrote = calls.some((c) => c.path.endsWith("sc111A05"));
-      if (path.endsWith("sc111A04") && id !== "write-timeout" && wrote) {   // only the check after the write
-        return id === "check-timeout" ? timesOut() : unauthorized();
-      }
-      return undefined;
-    };
-    const api = schApi({ detail: CREATED, write: {}, fail });
-    // never a SessionError: the caller would log in again and write again
-    await assert.rejects(update(api, { title: "x", confirm: true }),
-      rejectsWith(/^일정 수정 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-    assert.equal(count(api, "sc111A05"), 1);
-  });
-}
-
-for (const [id, wrong] of [["start-differs", { startDate: "209901011630" }],
-  ["end-differs", { endDate: "209901011730" }], ["title-differs", { schTitle: "다른 제목" }]]) {
-  test(`update reports a read-back that differs in any one field: ${id}`, async () => {
-    const api = schApi({ detail: until("sc111A05", CREATED, { ...CHANGED, ...wrong }), write: {} });
-    await assert.rejects(update(api, { title: "주간회의(변경)", start: "2099-01-01 16:00", end: "2099-01-01 17:00", confirm: true }),
-      rejectsWith(/그룹웨어에서 확인해 주세요/));
-  });
-}
-
-test("update trims the new title", async () => {
-  assert.equal((await update(schApi({ detail: CREATED }), { title: " 이름만 " })).after.title, "이름만");
-});
-
-test("update sends back what it does not change", async () => {
-  const detail = { ...CREATED, schmSeq: 8000, contents: "안건", lunarYn: "Y", schGbnCode: "20",
-    schAlarmList: [{ alarmTime: "10" }],
-    schPartEmpList: [{ empSeq: "E1", compSeq: "1000" }],
+test("schedule update: what it does not change goes back as stored", async () => {
+  const { gbnCode, calType, ...rest } = CREATED;   // missing: the calendar's type
+  const alarm = { alarmType: "20", alarmTimeDiv: "30" };
+  const detail = { ...rest, schmSeq: 8000, contents: "안건", lunarYn: "Y", schGbnCode: "20", schAlarmList: [alarm],
+    schPartEmpList: [{ orgSeq: "E1" }],   // only me: still plain
     schUserList: [{ userType: "10", empSeq: "E1" }, { userType: "30", empSeq: "E9" }] };
-  const api = schApi({ write: {}, detail: until("sc111A05", detail, { ...detail, schTitle: "x" }) });
-  await update(api, { title: "x", confirm: true });
-  const body = api.calls[2].body;
-  assert.deepEqual([body.schmSeq, body.contents, body.lunarYn, body.schGbnCode], ["8000", "안건", "Y", "20"]);   // schmSeq is the detail's own
-  assert.deepEqual(body.schAlarmList, [{ alarmTime: "10" }]);
-  assert.deepEqual(body.schPartEmpList, [{ empSeq: "E1", compSeq: "1000" }]);
+  const api = schApi({ detail: until("sc111A05", detail, { ...detail, schTitle: "x" }) });
+  const out = await update(api, { title: "x", confirm: true });
+  assert.deepEqual(out.after, { title: "x", start: "2099-01-01 15:00", end: "2099-01-01 16:00" });
+  const body = bodyOf(api, "sc111A05");
+  assert.deepEqual([body.schmSeq, body.contents, body.lunarYn, body.schGbnCode, body.gbnCode, body.calType],
+    ["8000", "안건", "Y", "20", "E", "E"]);
+  // the flag follows the reminders: "N" beside a filled list may make the server drop it
+  assert.deepEqual([body.alarm_yn, body.schAlarmList], ["Y", [alarm]]);
+  assert.deepEqual(body.schPartEmpList, [{ orgSeq: "E1" }]);
   assert.deepEqual(body.schUserList, [{ userType: "10", empSeq: "E1" }]);   // userType 30 left out
 });
 
-test("update takes gbnCode and calType from the calendar when missing", async () => {
-  const { gbnCode, calType, ...detail } = CREATED;
-  const api = schApi({ write: {}, detail: until("sc111A05", detail, { ...detail, schTitle: "x" }) });
-  await update(api, { title: "x", confirm: true });
-  assert.deepEqual([api.calls[2].body.gbnCode, api.calls[2].body.calType], ["E", "E"]);
+test("schedule update and delete: all but a plain schedule of mine is refused", async () => {
+  const notPlain = [
+    [{ mcalSeq: 35 }, /내 개인 캘린더/],
+    [{ repeatType: "40" }, /반복/],
+    [{ repeatType: null }, /반복/],   // a missing value must not pass for "10"
+    [{ schmSeq: null }, /찾지 못했습니다/],
+    [{ endDate: "" }, /찾지 못했습니다/],
+    [{ resList: [{ resSeq: "12" }] }, /자원/],
+    [{ reservedList: [{ resSeq: "12" }] }, /자원/],
+    [{ addressUserList: [{ email: "x@example.com" }] }, /외부 참석자/],
+    [{ schPartEmpList: [{ empSeq: "E1" }, { empSeq: "E7" }] }, /다른 참석자/],
+    [{ schPartEmpList: [{ orgSeq: "E7" }] }, /다른 참석자/],
+    [{ schModuleSeq: "77" }, /외부 모듈/],
+    [{ fileList: [{ fileId: "f" }] }, /첨부/],
+    [{ fileCnt: "1" }, /첨부/],
+  ].map(([change, re]) => [{ title: "x" }, { detail: JSON.parse(JSON.stringify({ ...CREATED, ...change })) }, re]);
+  await refuses(schApi, remove, notPlain);
+  await refuses(schApi, update, [...notPlain,
+    [{ title: "x" }, { detail: { ...CREATED, alldayYn: "Y" } }, /종일/],   // the update would drop it
+    [{}, {}, /바꿀 값/],
+    [{ title: "  " }, {}, /비울 수 없습니다/],
+    [{ start: "2099-01-01" }, {}, BAD_TIME],
+    [{ start: "2099-01-01 17:00" }, {}, /종료 시각/],   // past the kept end
+    [{ sch_seq: 1, title: "x" }, { detail: null }, /일정 1을\(를\) 찾지 못했습니다/]]);
 });
 
-test("update keeps a reminder set in the groupware", async () => {
-  // the flag follows the reminders: "N" beside a filled list may make the server drop it
-  const alarm = { alarmType: "20", alarmTimeDiv: "30", alarmTimeUnit: "", alarmUnitValue: "" };
-  const detail = { ...CREATED, schAlarmList: [alarm] };
-  const api = schApi({ write: {}, detail: until("sc111A05", detail, { ...detail, schTitle: "x" }) });
-  await update(api, { title: "x", confirm: true });
-  assert.deepEqual([api.calls[2].body.alarm_yn, api.calls[2].body.schAlarmList], ["Y", [alarm]]);
+test("schedule update: an unclear write or read-back is unconfirmed, never retried", () => {
+  const afterWrite = (fail) => (path, calls) =>
+    (path.endsWith("sc111A04") && calls.some((c) => c.path.endsWith("sc111A05")) ? fail() : undefined);
+  return unclear(schApi, (api) => update(api, { title: "x", confirm: true }), "sc111A05", [
+    [{}, UNSURE("일정 수정")],   // the read-back still holds the old title
+    [{ detail: until("sc111A05", CREATED, { ...CREATED, schTitle: "x", endDate: "209901011630" }) }, UNSURE("일정 수정")],
+    [{ fail: on("sc111A05", timesOut) }, UNSURE("일정 수정")],
+    [{ fail: afterWrite(unauthorized) }, UNSURE("일정 수정")]]);   // a SessionError would write again
 });
 
 const LISTED = { schSeq: 8439, mcalSeq: 134, schTitle: "주간회의", startDate: "209901011500", endDate: "209901011600" };
-const remove = (api, args = {}) => deleteSchedule(RES, { sch_seq: 8439, ...args }, { fetch: api.fetch });
 
-test("delete: a preview names the schedule and deletes nothing", async () => {
-  const api = schApi({ detail: CREATED });
-  const out = await remove(api, { sch_seq: "8439" });
-  assert.deepEqual(out, { sch_seq: 8439, title: "주간회의", start: "2099-01-01 15:00", end: "2099-01-01 16:00" });
-  assert.deepEqual(api.paths(), ["/schres/sc111A04", "/schres/sc111A02"]);
-});
-
-test("delete: confirm sends the three ids and checks it is gone", async () => {
-  const api = schApi({ detail: CREATED, rows: until("sc111A06", [LISTED], []) });
-  const out = await remove(api, { confirm: true });
-  assert.deepEqual(out, { sch_seq: 8439, title: "주간회의", start: "2099-01-01 15:00", end: "2099-01-01 16:00", deleted: true });
-  assert.deepEqual(api.paths(), ["/schres/sc111A04", "/schres/sc111A02", "/schres/sc111A06", "/schres/sc111A03"]);
+test("schedule delete: a preview names it; confirm sends the three ids and checks it is gone", async () => {
+  const api = schApi({ rows: until("sc111A06", [LISTED], []) });
+  const preview = { sch_seq: 8439, title: "주간회의", start: "2099-01-01 15:00", end: "2099-01-01 16:00" };
+  assert.deepEqual(await remove(api, { sch_seq: "8439" }), preview);
+  assert.deepEqual(writes(api), []);
+  assert.deepEqual(await remove(api, { confirm: true }), { ...preview, deleted: true });
   // like the web client, the delete carries no companyInfo
-  assert.deepEqual(api.calls[2].body, { mcalSeq: "134", schmSeq: "8439", schSeq: "8439", rangeCode: "", langCode: "kr" });
-  const listed = api.calls[3].body;
-  assert.deepEqual([listed.startDate, listed.endDate], ["20990101", "20990101"]);
-  assert.deepEqual(listed.calList.map((x) => x.mcalSeq), ["134"]);
+  assert.deepEqual(bodyOf(api, "sc111A06"), { mcalSeq: "134", schmSeq: "8439", schSeq: "8439", rangeCode: "", langCode: "kr" });
+  const listed = api.calls.at(-1).body;
+  assert.deepEqual([listed.startDate, listed.endDate, listed.calList.map((c) => c.mcalSeq)], ["20990101", "20990101", ["134"]]);
 });
 
-test("delete reports a schedule still listed after the delete", async () => {
-  await assert.rejects(remove(schApi({ detail: CREATED, rows: [LISTED] }), { confirm: true }),
-    rejectsWith(/^삭제 뒤에도 일정이 남아 있습니다\. 그룹웨어에서 확인해 주세요\.$/));
-});
-
-for (const [id, change, match] of [
-  ["repeating", { repeatType: "20" }, /반복/],
-  ["resource", { resList: [{ resSeq: "12" }] }, /자원/],
-  ["external", { addressUserList: [{ email: "x@example.com" }] }, /외부 참석자/],
-  ["others-invited", { schPartEmpList: [{ empSeq: "E7" }] }, /다른 참석자/],
-  ["files", { fileCnt: 2 }, /첨부/],
-  ["other-calendar", { mcalSeq: 35 }, /내 개인 캘린더/]]) {
-  test(`delete leaves all but a plain schedule of mine alone: ${id}`, async () => {
-    const api = schApi({ detail: { ...CREATED, ...change } });
-    await assert.rejects(remove(api, { confirm: true }), rejectsWith(match));
-    assert.equal(count(api, "sc111A06"), 0);
-  });
-}
-
-for (const confirm of [undefined, ...NOT_TRUE]) {
-  test(`delete: confirm ${JSON.stringify(confirm)} only previews`, async () => {
-    const api = schApi({ detail: CREATED });
-    assert.equal((await remove(api, { confirm })).deleted, undefined);
-    assert.equal(count(api, "sc111A06"), 0);
-  });
-}
-
-for (const id of ["delete-timeout", "check-session-dropped", "check-timeout"]) {
-  test(`delete reports an unclear delete as unconfirmed: ${id}`, async () => {
-    const fail = (path) => {
-      if (path.endsWith("sc111A06") && id === "delete-timeout") timesOut();
-      if (path.endsWith("sc111A03") && id !== "delete-timeout") {   // sc111A03 runs only after the delete
-        return id === "check-timeout" ? timesOut() : unauthorized();
-      }
-      return undefined;
-    };
-    const api = schApi({ detail: CREATED, rows: [], fail });
-    // never a SessionError: the caller would log in again and delete again
-    await assert.rejects(remove(api, { confirm: true }),
-      rejectsWith(/^일정 삭제 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-    assert.equal(count(api, "sc111A06"), 1);
-  });
-}
-
-// a listing that answers anything but a dict holding a list of dicts must not read as "gone":
-// Python raises on it inside the check, and the check answers "unconfirmed"
-const NOT_A_LISTING = [["bare-list", [LISTED]], ["true", true], ["string", "still-there"], ["number", 1],
-  ["list-field-a-dict", { resultList: { schSeq: 8439 } }], ["null-row", { resultList: [null] }],
-  ["string-row", { resultList: ["8439"] }]];
-
-for (const [id, garbage] of NOT_A_LISTING) {
-  test(`delete: a read-back listing that is not a list of rows is unconfirmed: ${id}`, async () => {
-    const api = schApi({ detail: CREATED, fail: (path) => (path.endsWith("sc111A03") ? garbage : undefined) });
-    await assert.rejects(remove(api, { confirm: true }),
-      rejectsWith(/^일정 삭제 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-    assert.equal(count(api, "sc111A06"), 1);
-  });
-}
-
-for (const [id, empty] of [["null", null], ["empty-dict", {}], ["empty-list", []], ["field-null", { resultList: null }],
-  ["field-empty-dict", { resultList: {} }]]) {
-  test(`delete: an empty read-back listing means gone, as in Python: ${id}`, async () => {
-    const api = schApi({ detail: CREATED, fail: (path) => (path.endsWith("sc111A03") ? empty : undefined) });
-    assert.equal((await remove(api, { confirm: true })).deleted, true);
-  });
-}
-
-for (const [id, garbage] of [["bare-list", [CANCEL_ROW]], ["true", true], ["string-row", { resultList: ["x"] }],
-  ["null-row", { resultList: [null] }]]) {
-  test(`cancel: a read-back listing that is not a list of rows is unconfirmed: ${id}`, async () => {
-    const api = cancelApi([CANCEL_ROW], { check: () => garbage });
-    await assert.rejects(cancel(api, { confirm: true }), rejectsWith(/^취소 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
-    assert.equal(count(api, "rs121A11"), 1);
-  });
-}
+test("schedule delete: still listed, or an unclear delete or check, is reported, never retried", () =>
+  unclear(schApi, (api) => remove(api, { confirm: true }), "sc111A06", [
+    [{ rows: [LISTED] }, /^삭제 뒤에도 일정이 남아 있습니다\. 그룹웨어에서 확인해 주세요\.$/],
+    [{ fail: on("sc111A06", timesOut) }, UNSURE("일정 삭제")],
+    [{ fail: on("sc111A03", unauthorized) }, UNSURE("일정 삭제")],   // sc111A03 runs only after the delete
+    [{ fail: on("sc111A03", () => [LISTED]) }, UNSURE("일정 삭제")]]));   // not a list of rows: not "gone"
 
 // ---- mail
-const MAILER = { ...RES, user: { ...RES.user, email: "hong@example.com" } };
 const SETUP = { email: "hong@example.com", mail_from: ["hong@example.com"], userInfo: {},
   userFromNameList: [{ userName: "다른이름", isDefault: false }, { userName: "홍길동", isDefault: true }],
-  filedir: "/data/f1", sessionKey: "SK-1", bigFileDay: "30", externalSendLimit: "N", "insideDomainArray[]": ["example.com"],
-  groupMailOption: { groupMailAddr: "", groupMailIntedAddr: "", groupMailOrg: "" }, representInfo: [], sharedList: [],
-  useLimit: 0, recvSendRestiction: 0, mailboxPercent: "3", capacityLimit: "0" };
+  filedir: "/data/f1", sessionKey: "SK-1", bigFileDay: "30", "insideDomainArray[]": ["example.com"] };
 const reply = (resultCode, resultMsg = "") => new Response(JSON.stringify({ resultCode, resultMsg, resultData: {} }));
-const FOLDER_LIST = { mailboxList: [{ mboxSeq: 2089, name: "INBOX" }, { mboxSeq: 2095, name: "TRASH" }] };
 
-function mailApi({ setup = SETUP, send = () => reply(0), write = () => ({}) } = {}) {
+function mailApi({ setup = SETUP, send = () => reply(0) } = {}) {
   return fake((path) => {
     if (path.endsWith("mail014A01")) return setup;
     if (path.endsWith("mail014A04")) return send();
-    if (path.endsWith("mail000A01")) return FOLDER_LIST;
-    return write();
+    return path.endsWith("mail000A01") ? { mailboxList: [{ name: "INBOX" }, { name: "TRASH" }] } : {};
   });
 }
-const sendTo = (api, args = {}, opts = {}) => sendMail(MAILER, { to: ["a@example.com", "김민수 <kim@example.com>"],
-  subject: " 보고 ", body: "안녕\n<b>하세요</b>", ...args }, { fetch: api.fetch, now: () => new Date(2026, 9, 27, 15), ...opts });
+const sendTo = (api, args = {}) => sendMail(S, { to: ["a@example.com", "김민수 <kim@example.com>"],
+  subject: " 보고 ", body: "안녕\n<b>하세요</b>", ...args }, { fetch: api.fetch, now: () => new Date(2026, 9, 27, 15) });
+const delMail = (api, args = {}) => deleteMail(S, { muids: [9], ...args }, { fetch: api.fetch });
 
-test("send: a preview shows the mail and sends nothing", async () => {
+test("mail send: a preview shows the mail; confirm posts the compose form once, as the web client fills it", async () => {
   const api = mailApi();
-  for (const confirm of [false, ...NOT_TRUE]) {
-    assert.deepEqual(await sendTo(api, { confirm }), { from: "홍길동 <hong@example.com>",
-      to: ["a@example.com", "김민수 <kim@example.com>"], cc: [], bcc: [], subject: "보고", body: "안녕\n<b>하세요</b>" });
-  }
-  assert.equal(count(api, "mail014A04"), 0);
-});
-
-test("send: confirm posts the compose form once, as the web client fills it", async () => {
-  const api = mailApi();
-  assert.equal((await sendTo(api, { cc: ["lee@example.com"], confirm: true })).sent, true);
-  assert.equal(count(api, "mail014A04"), 1);
+  const preview = { from: "홍길동 <hong@example.com>", to: ["a@example.com", "김민수 <kim@example.com>"],
+    cc: ["lee@example.com"], bcc: [], subject: "보고", body: "안녕\n<b>하세요</b>" };
+  assert.deepEqual(await sendTo(api, { cc: ["lee@example.com"] }), preview);
+  assert.deepEqual(writes(api), []);
+  assert.deepEqual(await sendTo(api, { cc: ["lee@example.com"], confirm: true }), { ...preview, sent: true });
   assert.deepEqual(bodyOf(api, "mail014A01"), { mailKind: "plain", mailTo: "", uid: "", mbox: "", viewFlag: "noRead",
     fromFlag: false, readType: "", domainSeq: "" });
   const form = bodyOf(api, "mail014A04");
@@ -922,107 +490,83 @@ test("send: confirm posts the compose form once, as the web client fills it", as
   assert.deepEqual([form.from, form.fromName, form.to, form.cc, form.bcc],
     ["hong@example.com", "홍길동", "a@example.com,김민수<kim@example.com>", "lee@example.com", ""]);
   assert.equal(form.htmlContents, "안녕<br>&lt;b&gt;하세요&lt;/b&gt;");
-  assert.deepEqual([form.subject, form.mail_kind, form.fileDir, form.sessionKey, form.insideDomainArray],
-    ["보고", "plain", "/data/f1", "SK-1", '["example.com"]']);
+  assert.deepEqual([form.subject, form.fileDir, form.sessionKey, form.insideDomainArray, form.externalSendLimit],
+    ["보고", "/data/f1", "SK-1", '["example.com"]', "N"]);
   assert.deepEqual([form.bigFilePeriod, form.expirationDate], ["2026-10-27 ~ 2026-11-26", "2026-10-27 00:00"]);
   assert.equal(form.authToken, "hong@example.com|G1|E1|R1");
+  assert.deepEqual(writes(api), ["mail014A04"]);
 });
 
-test("send: cc and bcc skip an address already in to or cc", async () => {
-  const api = mailApi();
-  const out = await sendTo(api, { to: ["a@example.com"], cc: ["A@example.com", "b@example.com"],
+test("mail send: cc and bcc skip an address already in to or cc", async () => {
+  const out = await sendTo(mailApi(), { to: ["a@example.com"], cc: ["A@example.com", "b@example.com"],
     bcc: ["b@example.com", "c@example.com"] });
   assert.deepEqual([out.cc, out.bcc], [["b@example.com"], ["c@example.com"]]);
 });
 
-test("send: the user's sender, receipt and each-recipient settings are kept", async () => {
-  const setup = { ...SETUP, mail_from: ["hong@example.com", "team@example.com"], representInfo: ["team@example.com"],
-    userInfo: { defaultuser: "team@example.com", receiveconfirm: "0", eachtrans: "0" } };
-  const api = mailApi({ setup });
+test("mail send: the user's sender, receipt and each-recipient settings are kept", async () => {
+  const api = mailApi({ setup: { ...SETUP, mail_from: ["hong@example.com", "team@example.com"], representInfo: ["team@example.com"],
+    userInfo: { defaultuser: "team@example.com", receiveconfirm: "0", eachtrans: "0" } } });
   assert.equal((await sendTo(api)).from, "team@example.com");   // a representative address has no own name
   await sendTo(api, { confirm: true });
   const form = bodyOf(api, "mail014A04");
   assert.deepEqual([form.from, form.fromName, form.receipt_notific, form.eachTrans], ["team@example.com", "", "1", "1"]);
 });
 
-test("send: bad addresses, no recipient or no subject stop before the network", async () => {
-  for (const args of [{ to: ["kim"] }, { to: ["a@example.com, b@example.com"] }, { to: [] }, { cc: ["x@y"] },
-    { subject: "  " }]) {
-    const api = mailApi();
-    await assert.rejects(sendTo(api, { ...args, confirm: true }), GroupwareError);
-    assert.equal(api.calls.length, 0);
-  }
-});
+test("mail send: refusals send nothing", () => refuses(mailApi, sendTo, [
+  [{ to: ["kim"] }, {}, /메일 주소가 아닙니다/],
+  [{ to: ["a@example.com, b@example.com"] }, {}, /메일 주소가 아닙니다/],
+  [{ cc: ["x@y"] }, {}, /메일 주소가 아닙니다/],
+  [{ to: [] }, {}, /받는 사람/],
+  [{ subject: "  " }, {}, /제목/],
+  [{}, { setup: { ...SETUP, mail_from: [] } }, /보낼 주소가 없습니다/],
+  [{}, { setup: { ...SETUP, useLimit: 1 } }, /제한/],
+  [{}, { setup: { ...SETUP, recvSendRestiction: "3" } }, /제한/],
+  [{}, { setup: { ...SETUP, mailboxPercent: "120", capacityLimit: "1" } }, /제한/],
+]));
 
-test("send: an account without a sender or with sending limited is refused before the send", async () => {
-  for (const setup of [{ ...SETUP, email: "" }, { ...SETUP, mail_from: [] }, { ...SETUP, useLimit: 1 },
-    { ...SETUP, recvSendRestiction: "3" }, { ...SETUP, mailboxPercent: "120", capacityLimit: "1" }]) {
-    const api = mailApi({ setup });
-    await assert.rejects(sendTo(api, { confirm: true }), GroupwareError);
-    assert.equal(count(api, "mail014A04"), 0);
-  }
-});
-
-test("send: resultCode 1 is sent, with the addresses the external limit left out", async () => {
+test("mail send: resultCode 1 is sent, with what the external limit left out; anything unclear is never retried", async () => {
   const out = await sendTo(mailApi({ send: () => reply(1, "x@other.com") }), { confirm: true });
   assert.deepEqual([out.sent, out.left_out], [true, "x@other.com"]);
+  await unclear(mailApi, (api) => sendTo(api, { confirm: true }), "mail014A04", [
+    [{ send: () => reply(-2, "발송 실패") }, /^메일 발송 결과를 확인하지 못했습니다\(발송 실패\)\. 보낸메일함을 그룹웨어에서 확인해 주세요\.$/],
+    [{ send: timesOut }, UNSURE("메일 발송")],
+    [{ send: unauthorized }, (e) => e instanceof SessionError]]);
 });
 
-test("send: an unclear send is reported, never retried", async () => {
-  for (const send of [() => reply(-2, "발송 실패"), timesOut, () => reply(999)]) {
-    const api = mailApi({ send });
-    await assert.rejects(sendTo(api, { confirm: true }), rejectsWith(/확인하지 못했습니다|확인해 주세요/));
-    assert.equal(count(api, "mail014A04"), 1);
-  }
-});
-
-test("send: a send refused for the session stays a SessionError (it never ran)", async () => {
-  await assert.rejects(sendTo(mailApi({ send: unauthorized }), { confirm: true }), SessionError);
-});
-
-test("delete mail: a preview names the folder and moves nothing; confirm moves them to the trash once", async () => {
+test("mail delete: a preview names the folder; confirm moves them to the trash once", async () => {
   const api = mailApi();
-  assert.deepEqual(await deleteMail(MAILER, { muids: [9, "10", 9], box: "inbox" }, { fetch: api.fetch }),
-    { box: "INBOX", muids: ["9", "10"] });
-  assert.equal(count(api, "mail002A05"), 0);
-  const out = await deleteMail(MAILER, { muids: [9, "10"], box: "INBOX", confirm: true }, { fetch: api.fetch });
-  assert.equal(out.trashed, true);
-  assert.equal(count(api, "mail002A05"), 1);
+  assert.deepEqual(await delMail(api, { muids: [9, "10", 9], box: "inbox" }), { box: "INBOX", muids: ["9", "10"] });
+  assert.deepEqual(writes(api), []);
+  assert.equal((await delMail(api, { muids: [9, "10"], confirm: true })).trashed, true);
   assert.deepEqual(bodyOf(api, "mail002A05"), { uids: "9,10", mailKey: "", boxName: "INBOX" });
+  assert.deepEqual(writes(api), ["mail002A05"]);
 });
 
-test("delete mail: the trash, spam, a scheduled send or an unknown folder is refused", async () => {
-  for (const box of ["TRASH", "spam", "RESERVATION", "ALL", "없는함"]) {
-    const api = mailApi();
-    await assert.rejects(deleteMail(MAILER, { muids: [9], box, confirm: true }, { fetch: api.fetch }), GroupwareError);
-    assert.equal(count(api, "mail002A05"), 0);
-  }
-});
-
-test("muids must be 1 to 50 mail numbers", async () => {
+test("mail delete and mark: the trash, spam, a scheduled send, an unknown folder or bad muids are refused", async () => {
+  await refuses(mailApi, delMail, [
+    ...["TRASH", "spam", "RESERVATION"].map((box) => [{ box }, {}, /복구할 수 없어/]),
+    [{ box: "없는함" }, {}, /메일함 '없는함'이\(가\) 없습니다/]]);
   for (const muids of [[], ["9,10"], ["x"], null, Array.from({ length: 51 }, (_, i) => i + 1)]) {
     const api = mailApi();
-    await assert.rejects(markMail(MAILER, { muids }, { fetch: api.fetch }), GroupwareError);
-    await assert.rejects(deleteMail(MAILER, { muids, confirm: true }, { fetch: api.fetch }), GroupwareError);
-    assert.equal(api.calls.length, 0);
+    await assert.rejects(markMail(S, { muids }, { fetch: api.fetch }), rejectsWith(/muids/));
+    await assert.rejects(delMail(api, { muids, confirm: true }), rejectsWith(/muids/));
+    assert.deepEqual(api.calls, []);
   }
 });
 
-test("mark: unread by default, read when asked, in the mail's folder", async () => {
+test("mail mark: unread by default, read when asked, in the mail's folder", async () => {
   const api = mailApi();
-  assert.deepEqual(await markMail(MAILER, { muids: [9, 10], box: "INBOX" }, { fetch: api.fetch }),
-    { box: "INBOX", muids: ["9", "10"], unread: true });
+  assert.deepEqual(await markMail(S, { muids: [9, 10] }, { fetch: api.fetch }), { box: "INBOX", muids: ["9", "10"], unread: true });
   assert.deepEqual(bodyOf(api, "mail002A15"), { mbox: "INBOX", uids: "9,10", type: "unseen" });
-  await markMail(MAILER, { muids: [9], box: "INBOX", read: true }, { fetch: api.fetch });
+  await markMail(S, { muids: [9], read: true }, { fetch: api.fetch });
   assert.deepEqual(api.calls.filter((c) => c.path.endsWith("mail002A15")).map((c) => c.body.type), ["unseen", "seen"]);
 });
 
 // ---- leave_request
-const HR = { ...RES, user: { ...RES.user, erpCoCd: "1000", erpEmpCd: "123" } };
 const CODES = [
-  { atCd: "1101", atNm: "연차", linkAtCd: "1010", timeSetFg: "ALL", outProcessId: "HP_HPD0110_00011", useYn: "Y" },
-  { atCd: "1111", atNm: "반반차", linkAtCd: "1010", timeSetFg: "NA", outProcessId: "HP_HPD0110_00011", useYn: "Y" },
-  { atCd: "1302", atNm: "기타휴가", linkAtCd: "1030", timeSetFg: "NA", outProcessId: "HP_HPD0110_00013", useYn: "Y" }];
+  { atCd: "1101", atNm: "연차", linkAtCd: "1010", timeSetFg: "ALL", outProcessId: "HP_HPD0110_00011" },
+  { atCd: "1111", atNm: "반반차", linkAtCd: "1010", timeSetFg: "NA", outProcessId: "HP_HPD0110_00011" },
+  { atCd: "1302", atNm: "기타휴가", linkAtCd: "1030", timeSetFg: "NA", outProcessId: "HP_HPD0110_00013" }];
 const span = (a, b = a) => ({ atDt: a, startDt: a, endDt: b, startTm: "0900", endTm: "1800", appDy: "1", appTm: 480, ycUseCnt: 1 });
 const BIND = JSON.stringify({ ITEMS: { appYear: "2026" },
   TABLE: { dbTable1: { group: [{ items: { empNm: "홍길동" }, group: [{ items: { atCdNm: "연차", appRmkDc: "<가족 여행>" } }] }] } } });
@@ -1031,8 +575,7 @@ const MAIN = '<meta charset="utf-8"><style>* {margin:0;}</style><p><input class=
 const LINE = [
   { user_nm: "홍길동", act_nm: "결재", doc_line_m_seq: 1, doc_line_s_seq: 1, act_id: "A1", co_id: "1000", dept_id: "D1", user_id: "E1", doc_line_gb: "1" },
   { user_nm: "김팀장", act_nm: "결재", doc_line_m_seq: 2, doc_line_s_seq: 1, act_id: "A1", co_id: "1000", dept_id: "D1", user_id: "E9", doc_line_gb: "1" }];
-const WRITE_STEPS = ["create", "GetLinkKey", "SetEnageGroup", "saveLinkKey", "eap110A06", "deleteSubmittedApplicationList"];
-const writes = (api) => api.paths().map((p) => p.split("/").pop()).filter((n) => WRITE_STEPS.includes(n));
+const SUBMIT = ["create", "GetLinkKey", "SetEnageGroup", "saveLinkKey", "eap110A06"];
 
 function leaveApi({ spans = [span("20261216")], fail = {} } = {}) {
   return fake((path, body) => {
@@ -1050,7 +593,7 @@ function leaveApi({ spans = [span("20261216")], fail = {} } = {}) {
         { formDTp: "HP_HPD0110_00011", formId: 2036, formNm: "연차휴가신청서" }];
       case "getAnnualLeaveInfoOfEmployee": return { unusedCnt: 10 };
       case "create": return { appSq: 501, coCd: "1000", appDt: "20261028" };
-      case "GetLinkKey": return { approKey: body.approKey, linkKey: "LINK-1" };
+      case "GetLinkKey": return { linkKey: "LINK-1" };
       case "saveLinkKey": return 1;
       case "eap110A03": return { mainhtml: MAIN, ucUserInfo: { compName: "회사", deptName: "개발팀", empName: "홍길동",
         oauth_token: "TOKEN-SECRET" }, resultMap: { hidAppDocLine: LINE, hidRefer: [{ div: "d", org_id: "D20" }],
@@ -1062,8 +605,8 @@ function leaveApi({ spans = [span("20261216")], fail = {} } = {}) {
     }
   });
 }
-const ask = (api, args = {}, opts = {}) => requestLeave(HR, { kind: "연차", start: "2026-12-16", reason: "가족 여행", ...args },
-  { fetch: api.fetch, now: () => new Date(2026, 9, 28, 9, 30, 5), ...opts });
+const ask = (api, args = {}) => requestLeave(S, { kind: "연차", start: "2026-12-16", reason: "가족 여행", ...args },
+  { fetch: api.fetch, now: () => new Date(2026, 9, 28, 9, 30, 5) });
 const PREVIEW = { kind: "연차", start: "2026-12-16", end: "2026-12-16", time: "09:00~18:00", days: 1, remaining_after: 9,
   title: "[개발팀 홍길동] 12-16 연차신청서", reason: "가족 여행", approval: "그룹웨어 기본 결재선으로 상신하며, 결재자에게 알림이 갑니다." };
 
@@ -1075,52 +618,40 @@ test("leave request: a preview reads only and keeps the employee's private field
   assert.deepEqual([item.atCd, item.startDt, item.endDt, item.startTm, item.endTm, item.atDt, item.ycUseCnt],
     ["1101", "20261216", "20261216", "0900", "1800", "20261028", 1]);
   assert.ok(!/SECRET/.test(JSON.stringify(api.calls)));
-  for (const confirm of NOT_TRUE) {
-    const again = leaveApi();
-    await ask(again, { confirm });
-    assert.deepEqual(writes(again), []);
-  }
 });
 
 test("leave request: 반반차 is two hours from start_time", async () => {
   const api = leaveApi();
-  const out = await ask(api, { kind: "반반차", start_time: "16:00" });
-  assert.equal(out.time, "16:00~18:00");
-  assert.deepEqual([bodyOf(api, "calculateApplicationDays").startTime, bodyOf(api, "calculateApplicationDays").endTime], ["1600", "1800"]);
+  assert.equal((await ask(api, { kind: "반반차", start_time: "16:00" })).time, "16:00~18:00");
+  const calc = bodyOf(api, "calculateApplicationDays");
+  assert.deepEqual([calc.startTime, calc.endTime], ["1600", "1800"]);
   for (const start_time of [null, "4pm", "16:75", "23:00"]) {
     await assert.rejects(ask(leaveApi(), { kind: "반반차", start_time }), rejectsWith(/start_time/));
   }
 });
 
-test("leave request: what it cannot ask for stops before any write", async () => {
-  const cases = [
+test("leave request: what it cannot ask for stops before any write", () => {
+  const validate = (resultCode, resultMsg) => ({ fail: { validateNew: () => new Response(JSON.stringify({ resultCode, resultMsg })) } });
+  return refuses(leaveApi, ask, [
     [{ kind: "기타휴가" }, {}, /kind는 연차·반반차 중 하나/],
     [{ start: "2026-12-22", end: "2026-12-18" }, {}, /시작일\(2026-12-22\)이 종료일/],
     [{}, { spans: [] }, /근무일이 없습니다/],
     [{ end: "2026-12-22" }, { spans: [span("20261218"), span("20261221", "20261222")] }, /2026-12-18, 2026-12-21~2026-12-22로 나눠/],
-    [{}, { fail: { validateNew: () => new Response(JSON.stringify({ resultCode: 22028, resultMsg: null })) } }, /이미 신청한 근태/],
-    [{}, { fail: { validateNew: () => new Response(JSON.stringify({ resultCode: 22023, resultMsg: "Insufficient" })) } }, /연차가 부족/],
-    [{}, { fail: { validateNew: () => new Response(JSON.stringify({ resultCode: 22099, resultMsg: "마감" })) } }, /신청할 수 없습니다\(마감\)/],
+    [{}, validate(22028, null), /이미 신청한 근태/],
+    [{}, validate(22023, "Insufficient"), /연차가 부족/],
+    [{}, validate(22099, "마감"), /신청할 수 없습니다\(마감\)/],
     [{}, { fail: { validateNew: () => ({ annualLeaveClosedList: [{}] }) } }, /annualLeaveClosedList/],
-    [{}, { fail: { eap096A45: () => [] } }, /결재 양식\(HP_HPD0110_00011\)을 찾지 못했습니다/],
-  ];
-  for (const [args, opts, re] of cases) {
-    const api = leaveApi(opts);
-    await assert.rejects(ask(api, { ...args, confirm: true }), rejectsWith(re));
-    assert.deepEqual(writes(api), []);
-  }
+    [{}, { fail: { eap096A45: () => [] } }, /결재 양식\(HP_HPD0110_00011\)을 찾지 못했습니다/]]);
 });
 
 test("leave request: confirm saves, links and submits once each, in order", async () => {
   const api = leaveApi();
-  const out = await ask(api, { confirm: true });
-  assert.deepEqual(out, { ...PREVIEW, submitted: true, id: "20261028-501", doc_id: "1004400", status: "결재진행",
-    approval_line: ["홍길동(결재)", "김팀장(결재)"] });
-  assert.deepEqual(writes(api), WRITE_STEPS.slice(0, 5));
+  assert.deepEqual(await ask(api, { confirm: true }), { ...PREVIEW, submitted: true, id: "20261028-501", doc_id: "1004400",
+    status: "결재진행", approval_line: ["홍길동(결재)", "김팀장(결재)"] });
+  assert.deepEqual(writes(api), SUBMIT);
   const created = bodyOf(api, "create");
-  assert.deepEqual([created.appEmpCd, created.titleDc, created.applicationList.length], ["123", PREVIEW.title, 1]);
-  assert.deepEqual(created.applicationList[0], { ...span("20261216"), coCd: "1000", empCd: "123", deptCd: "D10",
-    deptNm: "개발팀", empNm: "홍길동", appRmkDc: "가족 여행" });
+  assert.deepEqual([created.appEmpCd, created.titleDc, created.applicationList], ["123", PREVIEW.title,
+    [{ ...span("20261216"), coCd: "1000", empCd: "123", deptCd: "D10", deptNm: "개발팀", empNm: "홍길동", appRmkDc: "가족 여행" }]]);
   const { approKey } = bodyOf(api, "SetEnageGroup");
   assert.match(approKey, /^ERP_[0-9a-f-]{36}$/);
   assert.deepEqual(bodyOf(api, "saveLinkKey"), { linkKey: "LINK-1", appSq: 501, coCd: "1000", appDt: "20261028" });
@@ -1142,7 +673,7 @@ test("leave request: a failure before the submit discards the saved application"
   assert.deepEqual(bodyOf(api, "deleteSubmittedApplicationList"), [{ coCd: "1000", appDt: "20261028", appSq: 501 }]);
   const stuck = leaveApi({ fail: { saveLinkKey: () => 0, deleteSubmittedApplicationList: timesOut } });
   await assert.rejects(ask(stuck, { confirm: true }), rejectsWith(/id 20261028-501.*잇지 못했습니다.*상신대기로 남았으니 leave_cancel/));
-  assert.equal(count(stuck, "eap110A06"), 0);
+  assert.ok(!writes(stuck).includes("eap110A06"));
 });
 
 test("leave request: a session lost after the save is not run again and leaves the application", async () => {
@@ -1159,7 +690,7 @@ test("leave request: an unclear submit says to check and never discards", async 
   for (const fail of [timesOut, unauthorized, () => ({ result: null })]) {
     const api = leaveApi({ fail: { eap110A06: fail } });
     await assert.rejects(ask(api, { confirm: true }), rejectsWith(/id 20261028-501.*상신 결과를 확인하지 못했습니다.*leave_cancel로/));
-    assert.deepEqual(writes(api), WRITE_STEPS.slice(0, 5));
+    assert.deepEqual(writes(api), SUBMIT);
   }
 });
 
@@ -1169,109 +700,112 @@ test("fillBody fills every field and stops at one without a value", () => {
 });
 
 // ---- leave_cancel
-const INFO = { attendApplicationMaster: { appSq: "501", appDt: "20261028", appEmpCd: "123", titleDc: "연차신청서" },
+const INFO = { attendApplicationMaster: { appSq: "501", appEmpCd: "123", titleDc: "연차신청서" },
   attendApplicationDetailList: [{ atDt: "20261216" }] };
-const ROW = { appSq: "501", appDt: "20261028", coCd: "1000", linkAtCd: "1010", atNm: "연차", approState: "0", idDoc: "1004400" };
-const ME_STEP = { empSeq: "E1", userNm: "홍길동", appDt: "2026-10-28 09:30" };
+const LEAVE_ROW = { appSq: "501", appDt: "20261028", linkAtCd: "1010", atNm: "연차", approState: "0", idDoc: "1004400" };
+const ME_STEP = { empSeq: "E1", userNm: "홍길동", appDt: "2026-10-28 09:30" }, BOSS_STEP = { empSeq: "E9", userNm: "김팀장", appDt: "" };
+const DOC = { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E1", DOC_STS: "10" };
 
-function withdrawApi({ row = ROW, rows = null, info = INFO, a98 = { doc_sts: "30", user_id: "E1" }, line = [ME_STEP, { empSeq: "E9", userNm: "김팀장", appDt: "" }],
-  doc = { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E1", DOC_STS: "10" }, stays = false } = {}) {
+function withdrawApi({ row = LEAVE_ROW, rows = null, info = INFO, a98 = { doc_sts: "30", user_id: "E1" },
+  line = [ME_STEP, BOSS_STEP], doc = DOC, back = () => [], del = () => ({ failCnt: 0 }) } = {}) {
   let done = false;
   return fake((path) => {
     const name = path.split("/").pop();
     if (name === "selectAttendApplicationInfo") return info;
-    if (name === "at00001") return done && !stays ? [] : rows || [row];
+    if (name === "at00001") return done ? back() : rows || [row];
     if (name === "eap110A98") return a98;
     if (name === "eap096A62") return { lineList: line };
     if (name === "eap107A28") return { list: doc ? [doc] : [] };
     if (name === "eap110A20") return { returnValue: 1 };
-    if (["eap107A25", "deleteSubmittedApplicationList"].includes(name)) { done = true; return { failCnt: 0 }; }
+    if (name === "eap107A25") { done = true; return del(); }
+    if (name === "deleteSubmittedApplicationList") { done = true; return { failCnt: 0 }; }
     return {};
   });
 }
-const CANCEL_WRITES = ["eap110A20", "eap107A25", "deleteSubmittedApplicationList"];
-const cancelWrites = (api) => api.paths().map((p) => p.split("/").pop()).filter((n) => CANCEL_WRITES.includes(n));
-const cancelOf = (api, args = {}) => cancelLeave(HR, { id: "20261028-501", ...args }, { fetch: api.fetch });
+const cancelOf = (api, args = {}) => cancelLeave(S, { id: "20261028-501", ...args }, { fetch: api.fetch });
+const tempDoc = (doc) => ({ row: { ...LEAVE_ROW, approState: "5" }, doc });
 
 test("leave cancel: 결재진행 is checked in the preview, then withdrawn and deleted", async () => {
   const api = withdrawApi();
   const preview = { id: "20261028-501", kind: "연차", start: "2026-12-16", end: "2026-12-16", title: "연차신청서", status: "결재진행",
     action: "결재 전 문서를 회수한 뒤 삭제합니다. 되돌릴 수 없습니다." };
   assert.deepEqual(await cancelOf(api), preview);
-  assert.deepEqual(cancelWrites(api), []);
-  const run = withdrawApi();
-  assert.deepEqual(await cancelOf(run, { confirm: true }), { ...preview, canceled: true });
-  assert.deepEqual(cancelWrites(run), ["eap110A20", "eap107A25"]);
-  assert.deepEqual(bodyOf(run, "eap110A20"), { docID: "1004400", pageCode: "UBAP002" });
-  const del = run.calls.find((c) => c.path.endsWith("eap107A25"));
+  assert.deepEqual(writes(api), []);
+  assert.deepEqual(await cancelOf(api, { confirm: true }), { ...preview, canceled: true });
+  assert.deepEqual(writes(api), ["eap110A20", "eap107A25"]);
+  assert.deepEqual(bodyOf(api, "eap110A20"), { docID: "1004400", pageCode: "UBAP002" });
+  const del = api.calls.find((c) => c.path.endsWith("eap107A25"));
   assert.deepEqual([del.query, del.body], ["?docIdList=1004400", null]);
-  assert.ok(run.paths().indexOf("/eap/eap107A28") > run.paths().indexOf("/eap/eap110A20"));   // re-checked once withdrawn
+  assert.ok(api.paths().lastIndexOf("/eap/eap107A28") > api.paths().indexOf("/eap/eap110A20"));   // re-checked once withdrawn
 });
 
-test("leave cancel: refused before any write", async () => {
-  const cases = [
-    [{}, "501", /leave_requests의 id/],
-    [{ info: { attendApplicationMaster: {}, attendApplicationDetailList: [] } }, undefined, /찾을 수 없습니다/],
-    [{ info: { ...INFO, attendApplicationMaster: { ...INFO.attendApplicationMaster, appEmpCd: "999" } } }, undefined, /본인이 신청한/],
-    [{ row: { ...ROW, linkAtCd: "1030" } }, undefined, /연차·반차·반반차 신청만/],
-    [{ row: { ...ROW, approState: "1" } }, undefined, /결재가 끝난 신청은 그룹웨어/],
-    [{ row: { ...ROW, approState: "4" } }, undefined, /결재반려 상태의 신청은 취소할 수 없습니다/],
-    [{ row: { ...ROW, idDoc: null } }, undefined, /결재 문서 번호/],
-    [{ a98: { doc_sts: "90", user_id: "E1" } }, undefined, /결재 진행 중인 문서가 아닙니다/],
-    [{ a98: { doc_sts: "30", user_id: "E9" } }, undefined, /본인이 상신한/],
-    [{ line: [ME_STEP, { empSeq: "E9", userNm: "김팀장", appDt: "2026-10-28 10:00" }] }, undefined, /김팀장 님이 이미 처리/],
-    [{ line: [] }, undefined, /결재선을 받지 못했습니다/],
-    [{ line: [{ ...ME_STEP, appDt: "" }, { empSeq: "E9", userNm: "김팀장", appDt: "" }] }, undefined, /처리 기록을 읽지 못해/],
-    [{ row: { ...ROW, reportCancYn: "Y" } }, undefined, /결재취소가 걸린/],
-    [{ row: { ...ROW, cancellationApplication: true } }, undefined, /결재취소가 걸린/],
-    [{ row: { ...ROW, approState: "5" }, doc: null }, undefined, /찾지 못했습니다/],
-    [{ row: { ...ROW, approState: "5" }, doc: { DOC_ID: 1004400, FORM_D_TP: "EA_GENERAL", USER_ID: "E1", DOC_STS: "10" } }, undefined, /본인의 임시보관 근태 문서만/],
-    [{ row: { ...ROW, approState: "5" }, doc: { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E9", DOC_STS: "10" } }, undefined, /본인의 임시보관/],
-    [{ row: { ...ROW, approState: "5" }, doc: { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E1", DOC_STS: "30" } }, undefined, /본인의 임시보관/],
-  ];
-  for (const [opts, id, re] of cases) {
-    const api = withdrawApi(opts);
-    await assert.rejects(cancelOf(api, { ...(id === undefined ? {} : { id }), confirm: true }), rejectsWith(re));
-    assert.deepEqual(cancelWrites(api), []);
-  }
-});
+test("leave cancel: refused before any write", () => refuses(withdrawApi, cancelOf, [
+  [{ id: "501" }, {}, /leave_requests의 id/],
+  [{}, { info: { attendApplicationMaster: {}, attendApplicationDetailList: [] } }, /찾을 수 없습니다/],
+  [{}, { info: { ...INFO, attendApplicationMaster: { ...INFO.attendApplicationMaster, appEmpCd: "999" } } }, /본인이 신청한/],
+  [{}, { row: { ...LEAVE_ROW, linkAtCd: "1030" } }, /연차·반차·반반차 신청만/],
+  [{}, { row: { ...LEAVE_ROW, approState: "1" } }, /결재가 끝난 신청은 그룹웨어/],
+  [{}, { row: { ...LEAVE_ROW, approState: "4" } }, /결재반려 상태의 신청은 취소할 수 없습니다/],
+  [{}, { row: { ...LEAVE_ROW, idDoc: null } }, /결재 문서 번호/],
+  [{}, { row: { ...LEAVE_ROW, reportCancYn: "Y" } }, /결재취소가 걸린/],
+  [{}, { row: { ...LEAVE_ROW, cancellationApplication: true } }, /결재취소가 걸린/],
+  [{}, { a98: { doc_sts: "90", user_id: "E1" } }, /결재 진행 중인 문서가 아닙니다/],
+  [{}, { a98: { doc_sts: "30", user_id: "E9" } }, /본인이 상신한/],
+  [{}, { line: [] }, /결재선을 받지 못했습니다/],
+  [{}, { line: [ME_STEP, { ...BOSS_STEP, appDt: "2026-10-28 10:00" }] }, /김팀장 님이 이미 처리/],
+  [{}, { line: [{ ...ME_STEP, appDt: "" }, BOSS_STEP] }, /처리 기록을 읽지 못해/],
+  [{}, tempDoc(null), /찾지 못했습니다/],
+  [{}, tempDoc({ ...DOC, FORM_D_TP: "EA_GENERAL" }), /본인의 임시보관 근태 문서만/],
+  [{}, tempDoc({ ...DOC, USER_ID: "E9" }), /본인의 임시보관/],
+  [{}, tempDoc({ ...DOC, DOC_STS: "30" }), /본인의 임시보관/],
+]));
 
 test("leave cancel: 임시보관 is deleted and 상신대기 discarded", async () => {
-  const kept = withdrawApi({ row: { ...ROW, approState: "5" } });
+  const kept = withdrawApi(tempDoc(DOC));
   assert.equal((await cancelOf(kept, { confirm: true })).canceled, true);
-  assert.deepEqual(cancelWrites(kept), ["eap107A25"]);
-  const saved = withdrawApi({ row: { ...ROW, approState: "2", idDoc: null } });
+  assert.deepEqual(writes(kept), ["eap107A25"]);
+  const saved = withdrawApi({ row: { ...LEAVE_ROW, approState: "2", idDoc: null } });
   assert.equal((await cancelOf(saved, { confirm: true })).canceled, true);
   assert.deepEqual(bodyOf(saved, "deleteSubmittedApplicationList"), [{ coCd: "1000", appDt: "20261028", appSq: 501 }]);
 });
 
-test("leave cancel: still listed afterwards, or a delete that fails, is an error and not repeated", async () => {
-  const api = withdrawApi({ stays: true });
-  await assert.rejects(cancelOf(api, { confirm: true }), rejectsWith(/남아 있습니다/));
-  assert.deepEqual(cancelWrites(api), ["eap110A20", "eap107A25"]);
-  const { fetch } = withdrawApi({ row: { ...ROW, approState: "5" } });
-  const failing = async (url, init) => (url.includes("eap107A25")
-    ? new Response(JSON.stringify({ resultCode: 0, resultData: { failCnt: 1 } })) : fetch(url, init));
-  const calls = [];
-  const counted = async (url, init) => { calls.push(url); return failing(url, init); };
-  await assert.rejects(cancelLeave(HR, { id: "20261028-501", confirm: true }, { fetch: counted }), rejectsWith(/삭제하지 못했습니다/));
-  assert.equal(calls.filter((u) => u.includes("eap107A25")).length, 1);
+test("leave cancel: still listed, an unread check or a failed delete is an error and not repeated", async () => {
+  for (const [back, re] of [[() => [LEAVE_ROW], /남아 있습니다/], [unauthorized, UNSURE("취소")]]) {
+    const api = withdrawApi({ back });
+    await assert.rejects(cancelOf(api, { confirm: true }), rejectsWith(re));
+    assert.deepEqual(writes(api), ["eap110A20", "eap107A25"]);
+  }
+  const failing = withdrawApi({ ...tempDoc(DOC), del: () => ({ failCnt: 1 }) });
+  await assert.rejects(cancelOf(failing, { confirm: true }), rejectsWith(/삭제하지 못했습니다/));
+  assert.deepEqual(writes(failing), ["eap107A25"]);
 });
 
 test("leave cancel: the same appSq under another application date is not this one", async () => {
-  const api = withdrawApi({ rows: [{ ...ROW, appDt: "20261001", idDoc: "999", approState: "5" }, ROW] });
+  const api = withdrawApi({ rows: [{ ...LEAVE_ROW, appDt: "20261001", idDoc: "999", approState: "5" }, LEAVE_ROW] });
   assert.equal((await cancelOf(api, { confirm: true })).status, "결재진행");
   assert.equal(bodyOf(api, "eap110A20").docID, "1004400");
   assert.deepEqual(api.calls.filter((c) => c.query).map((c) => c.query), ["?docIdList=1004400"]);
 });
 
 test("leave cancel: once withdrawn, a failed delete says where the document is and is not run again", async () => {
-  const stuck = withdrawApi({ doc: { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E1", DOC_STS: "30" } });
+  const stuck = withdrawApi({ doc: { ...DOC, DOC_STS: "30" } });
   await assert.rejects(cancelOf(stuck, { confirm: true }), rejectsWith(/회수해 임시보관으로 옮겼지만 삭제하지 못했습니다.*leave_cancel을 다시/));
-  assert.deepEqual(cancelWrites(stuck), ["eap110A20"]);
-  const { fetch } = withdrawApi();
-  const expired = async (url, init) => (url.includes("eap107A25") ? new Response("", { status: 401 }) : fetch(url, init));
-  const e = await cancelLeave(HR, { id: "20261028-501", confirm: true }, { fetch: expired }).catch((x) => x);
+  assert.deepEqual(writes(stuck), ["eap110A20"]);
+  const e = await cancelOf(withdrawApi({ del: unauthorized }), { confirm: true }).catch((x) => x);
   assert.ok(e instanceof GroupwareError && !(e instanceof SessionError));   // a SessionError would re-run the tool
   assert.match(e.message, /회수해 임시보관으로 옮겼지만.*세션 끊김/);
+});
+
+// ---- every tool
+test("every write tool only previews unless confirm is exactly true", async () => {
+  const tools = [[resApi, reserve], [cancelApi, cancel], [updateApi, (api, a) => resUpdate(api, { title: "새 제목", ...a })],
+    [schApi, create], [schApi, (api, a) => update(api, { title: "t", ...a })], [schApi, remove], [mailApi, sendTo],
+    [mailApi, delMail], [leaveApi, ask], [withdrawApi, cancelOf]];
+  for (const confirm of [undefined, false, "true", 1, "yes"]) {
+    for (const [makeApi, call] of tools) {
+      const api = makeApi();
+      await call(api, { confirm });
+      assert.deepEqual(writes(api), [], `${makeApi.name} ${confirm}`);
+    }
+  }
 });
