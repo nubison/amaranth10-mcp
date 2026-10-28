@@ -76,9 +76,10 @@ export function sign(signKey, token, tid, ts, pathname) {
   return createHmac("sha256", signKey).update(token + tid + ts + pathname).digest("base64");
 }
 
-/** A signed POST: body as JSON, or a FormData as multipart. Returns resultData; with full, the whole reply,
- * its resultCode left to the caller (a send's "1" means sent with some recipients left out). */
-export async function request(session, pathname, body, { fetch = globalThis.fetch, full = false } = {}) {
+/** A signed POST: body as JSON, or a FormData as multipart; with get, a GET of pathname's query (the
+ * approval delete, answered as one server-sent "data:" event). Returns resultData; with full, the whole
+ * reply, its resultCode left to the caller (a send's "1" means sent with some recipients left out). */
+export async function request(session, pathname, body, { fetch = globalThis.fetch, full = false, get = false } = {}) {
   const path = pathname.split(/[?#]/)[0];
   const id = tid(), ts = now();
   const { base, token, signKey } = session;
@@ -89,7 +90,7 @@ export async function request(session, pathname, body, { fetch = globalThis.fetc
     "transaction-id": id,
     "wehago-sign": sign(signKey, token, id, ts, path),
     "access-domain": base,
-    ...(body instanceof FormData ? {} : { "content-type": "application/json" }),   // fetch sets the boundary
+    ...(get ? { accept: "text/event-stream" } : body instanceof FormData ? {} : { "content-type": "application/json" }),
     // the klago gateway authenticates on BIZCUBE_AT/HK, built from the token (not the jar's oAuthToken)
     cookie: `oAuthToken=${token}; signKey=${signKey}; BIZCUBE_AT=${token}; BIZCUBE_HK=${signKey}; BIZCUBE_TYPE=Web`,
     origin: base,
@@ -97,14 +98,15 @@ export async function request(session, pathname, body, { fetch = globalThis.fetc
   };
   let outcome = "no response";
   try {
-    const resp = await send(fetch, base + pathname, { method: "POST", headers,
+    // FormData: fetch sets the multipart boundary itself
+    const resp = await send(fetch, base + pathname, get ? { method: "GET", headers } : { method: "POST", headers,
       body: body instanceof FormData ? body : JSON.stringify(body) });
     outcome = `HTTP ${resp.status}`;
     if (resp.status === 401 || resp.status === 403) throw new SessionError(`${path}: HTTP ${resp.status}`);
     if (!resp.text) throw new GroupwareError(`${path}: empty response (missing required field?)`);
     let data;
     try {
-      data = JSON.parse(resp.text);
+      data = JSON.parse(get ? resp.text.replace(/^\s*data:/, "") : resp.text);
     } catch {
       throw new GroupwareError(`${path}: non-JSON response`);
     }

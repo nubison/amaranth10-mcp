@@ -1,9 +1,12 @@
-// Resource, schedule and mail writes: a preview unless args.confirm is exactly true, one write call that
-// is never retried, a read-back, and a result it cannot confirm says to check the groupware instead
+// Resource, schedule, mail and leave writes: a preview unless args.confirm is exactly true, write calls that
+// are never retried, a read-back, and a result it cannot confirm says to check the groupware instead
 // of inviting another try.
+import { randomUUID } from "node:crypto";
+
 import { GroupwareError, SessionError, request } from "./client.js";
-import { calendarRows, calendars, companyInfo, fetchMailFolders, fetchResources, fmtStamp, num, parseLocal,
-  resolveAttendees, scheduleRows, toApiDt } from "./read.js";
+import { calendarRows, calendars, companyInfo, erp, fetchLeaveBalance, fetchMailFolders, fetchResources, fmtDate,
+  fmtStamp, leaveRows, leaveStatus, num, parseLocal, resolveAttendees, scheduleRows, toApiDay, toApiDt,
+  ymdOf } from "./read.js";
 
 const CHECK = "그룹웨어에서 확인해 주세요.";
 
@@ -21,9 +24,9 @@ const succeeded = (result) => ["1", "true"].includes(str((isDict(result) ? resul
 // One write call. A SessionError means the gateway refused it before it ran, so the caller's one
 // re-login sends the first write, not a second; anything else unclear may have landed and must
 // say so. No cause is kept: transport text can carry header values.
-async function writeOnce(session, path, body, what, { fetch, full = false } = {}) {
+async function writeOnce(session, path, body, what, opts = {}) {
   try {
-    return await request(session, path, body, { fetch, full });
+    return await request(session, path, body, opts);
   } catch (e) {
     if (e instanceof SessionError) throw e;
     if (e instanceof GroupwareError) throw new GroupwareError(`${e.message} ${CHECK}`);
@@ -463,4 +466,277 @@ export async function markMail(session, { muids, box = "INBOX", read = false } =
   await writeOnce(session, "/mail/mail002A15", { mbox: name, uids: uids.join(","), type: read === true ? "seen" : "unseen" },
     "읽음 표시", { fetch });
   return { box: name, muids: uids, unread: read !== true };
+}
+
+// ---- leave
+// 연차 and its half and quarter days (linkAtCd 1010: one form, one balance). A request is saved, linked to an
+// e-approval document and submitted in one approved call, as the web client does it (captured 2026-10-28); a
+// cancel withdraws and deletes a document no one has acted on yet. No edit: the groupware has none either.
+const LEAVE = "1010";
+const LEAVE_FORM = "HP_HPD0110_";   // the attendance forms' kind; a delete touches no other document
+const INTERLOCK = "/human/attendapplication/interlock";
+const fmtTm = (t) => `${t.slice(0, 2)}:${t.slice(2, 4)}`;
+const hm = (minutes) => `${String(Math.floor(minutes / 60)).padStart(2, "0")}${String(minutes % 60).padStart(2, "0")}`;
+const pad2 = (n) => String(n).padStart(2, "0");
+const stamp = (d) => `${ymd(d)} ${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+const sameApp = (r, appDt, appSq) => str(r.appDt) === str(appDt) && str(r.appSq) === str(appSq);   // appSq alone may repeat
+const stretch = (x) => (x.startDt === x.endDt ? fmtDate(x.startDt) : `${fmtDate(x.startDt)}~${fmtDate(x.endDt)}`);
+// validateNew's refusals come as result codes (live 2026-10-28), 22028 without a message
+const REFUSED = { 22028: "그 기간에 이미 신청한 근태가 있습니다.",
+  22023: "남은 연차가 부족하거나 마이너스 연차를 쓸 수 없습니다." };
+
+async function leaveForm(session, formDTp, fetch) {
+  const u = session.user;
+  const rows = await request(session, "/eap/eap096A45", { header: { groupSeq: u.groupSeq, empSeq: u.empSeq },
+    body: { companyInfo: { compSeq: u.compSeq, bizSeq: u.compSeq, deptSeq: u.deptSeq }, formDTp, langCode: "kr" } },
+  { fetch });
+  const forms = (Array.isArray(rows) ? rows : []).filter((f) => f.formDTp === formDTp);
+  if (forms.length !== 1) throw new GroupwareError(`결재 양식(${formDTp})을 찾지 못했습니다. ${CHECK}`);
+  return forms[0];
+}
+
+// Everything the request needs, read only: the code, the work-day window, the days it takes, the server's
+// own checks, the title and the form
+async function planLeave(session, { kind, start, end, reason, start_time }, { fetch, now }) {
+  const [coCd, empCd] = erp(session);
+  const first = toApiDay(start), last = end ? toApiDay(end) : first;
+  if (first > last) throw new GroupwareError(`시작일(${fmtDate(first)})이 종료일(${fmtDate(last)})보다 늦습니다.`);
+  const base = await request(session, "/human/common/attendapplication/getApplicationBaseInfo", {}, { fetch });
+  const codes = (base?.attendCodeList || []).filter((c) => c.linkAtCd === LEAVE && c.useYn !== "N" && c.outProcessId);
+  const code = codes.find((c) => c.atNm === String(kind ?? "").trim());
+  if (!code) throw new GroupwareError(`kind는 ${codes.map((c) => c.atNm).join("·")} 중 하나로 넣어 주세요.`);
+  const window = await request(session, "/human/common/attendapplication/getStartTmEndTmByWorkType",
+    { empCd, startDate: first, endDate: first, atCd: code.atCd, linkAtCd: LEAVE }, { fetch });
+  let startTm = str(window?.startTm), endTm = str(window?.endTm);
+  if (code.timeSetFg === "NA") {   // 반반차: the web form leaves its two hours to the person
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(start_time ?? "").trim());
+    const at = m && Number(m[2]) < 60 ? Number(m[1]) * 60 + Number(m[2]) : NaN;
+    if (!(at + 120 <= 24 * 60)) throw new GroupwareError(`${code.atNm}은 시작 시각(start_time, 'HH:MM')을 넣어 주세요. 2시간으로 신청합니다.`);
+    startTm = hm(at); endTm = hm(at + 120);
+  }
+  if (!/^\d{4}$/.test(startTm) || !/^\d{4}$/.test(endTm)) throw new GroupwareError(`근무 시각을 받지 못했습니다. ${CHECK}`);
+  const calc = await request(session, "/human/common/attendapplication/calculateApplicationDays", { startDate: first,
+    endDate: last, startTime: startTm, endTime: endTm, atCd: code.atCd, linkAtCd: LEAVE, empCd, appRmkDc: reason,
+    calculateOption: "HOLIDAY_EXCLUSION" }, { fetch });
+  const spans = calc?.holidayExclusionApplicationList || [];
+  if (!spans.length) throw new GroupwareError("그 기간에는 근무일이 없습니다.");
+  // ponytail: one stretch of work days per request; the approval body repeats its table row per stretch, never tried
+  if (spans.length > 1) throw new GroupwareError(`주말·휴일로 나뉘는 기간입니다. ${spans.map(stretch).join(", ")}로 나눠 따로 신청해 주세요.`);
+  const employee = { empCd, korNm: base.employee?.korNm || "", deptCd: base.employee?.deptCd || "", deptNm: calc.deptNm || "",
+    divNm: "" };   // the employee record also holds a birth date and a resident number: only these leave it
+  // the fields of the web form's item the check reads (live 2026-10-28: duplicate and short balance still caught)
+  const check = await request(session, "/human/attendapplication/validateNew", { checkRange: "ALL", checkPoint: "ADD",
+    empCdList: [empCd], alreadyAddedItems: [], newItem: { coCd, empCd, atCd: code.atCd, linkAtCd: LEAVE,
+      timeSetFg: code.timeSetFg, atDt: ymdOf(now()), startDt: first, endDt: last, startTm, endTm,
+      appDy: num(calc.applicationDaysCnt), appDyFg: "D", appTm: num(calc.applicationMinutes), dailyAppTm: num(calc.dailyAppTm),
+      ycUseCnt: num(calc.ycUseCnt), dailyCalculatedTimeYcUseCnt: num(calc.dailyCalculatedTimeYcUseCnt), appRmkDc: reason,
+      datePeriod: { from: first, to: last }, repeatTp: "NONE", repeatFgList: [], employeeList: [employee],
+      workTp: window?.workTp ?? null, holidayYn: "N" } }, { fetch, full: true });
+  if (str(check.resultCode) !== "0") {
+    throw new GroupwareError(REFUSED[check.resultCode] ?? `신청할 수 없습니다(${or(check.resultMsg, check.resultCode)}).`);
+  }
+  const blocked = Object.entries(isDict(check.resultData) ? check.resultData : {}).filter(([, v]) => py(v)).map(([k]) => k);
+  if (blocked.length) throw new GroupwareError(`신청할 수 없습니다(${blocked.join(", ")}).`);
+  const items = spans.map((x) => ({ ...x, coCd, empCd, deptCd: employee.deptCd, deptNm: employee.deptNm,
+    empNm: calc.empNm || employee.korNm, appRmkDc: reason }));
+  const title = await request(session, "/human/attendapplication/0hr00011", { applicationList: items, employeeList: [employee] },
+    { fetch });
+  if (typeof title !== "string" || !title) throw new GroupwareError(`신청서 제목을 받지 못했습니다. ${CHECK}`);
+  const form = await leaveForm(session, code.outProcessId, fetch);
+  const days = num(calc.ycUseCnt), { remaining } = await fetchLeaveBalance(session, {}, { fetch, now });
+  return { code, employee, items, title, form, first, last, preview: { kind: code.atNm, start: fmtDate(first),
+    end: fmtDate(last), time: `${fmtTm(startTm)}~${fmtTm(endTm)}`, days, remaining_after: remaining - days, title, reason,
+    approval: "그룹웨어 기본 결재선으로 상신하며, 결재자에게 알림이 갑니다." } };
+}
+
+// The web editor swaps each <input mapping_key> of the form for its bound value and wraps head and body
+export function fillBody(mainhtml, bindText) {
+  const bind = JSON.parse(bindText), values = { ...bind.ITEMS };
+  const walk = (groups) => (groups || []).forEach((g) => { Object.assign(values, g.items); walk(g.group); });
+  walk(bind.TABLE?.dbTable1?.group);   // the employee row, then the application rows nested in it
+  const body = String(mainhtml).replace(/<input\b[^>]*\bmapping_key="([^"]+)"[^>]*>/g, (_, k) => {
+    if (!Object.hasOwn(values, k)) throw new GroupwareError(`결재 본문 항목(${k})의 값을 받지 못했습니다.`);
+    return html(values[k] ?? "");
+  });
+  return body.replace(/^(<meta charset="utf-8">\s*<style>[^<]*<\/style>)/, "<head>$1\n</head><body>") + "</body>";
+}
+
+// Link the saved application to a new e-approval document and load its draft. Nothing here makes a
+// document yet, so a failure leaves only the application.
+async function linkDraft(session, { code, form, title }, { coCd, appDt, appSq }, fetch) {
+  const approKey = `ERP_${randomUUID()}`;
+  const linkKey = (await request(session, "/system/apiUtilEap/GetLinkKey", { menuCode: "HPD0110", approKey, vPCoCd: coCd, coCd },
+    { fetch }))?.linkKey;
+  if (!linkKey) throw new GroupwareError("결재 연결 키를 받지 못했습니다.");
+  await request(session, "/system/apiUtilEap/SetEnageGroup", { approKey, formDTp: code.outProcessId, formId: form.formId,
+    linkKey, formNm: form.formNm, docTitle: title, contents: "", contentsApi: `${INTERLOCK}/getInterlockFormContents`,
+    statusApi: `${INTERLOCK}/setInterlockSync`, dummy1: "", link: "", vPCoCd: coCd, coCd }, { fetch });
+  if (num(await request(session, "/human/openapi/attendapplication/saveLinkKey", { linkKey, appSq, coCd, appDt }, { fetch })) !== 1) {
+    throw new GroupwareError("근태신청과 결재 문서를 잇지 못했습니다.");
+  }
+  const draft = await request(session, "/eap/eap110A03", { docID: 0, formID: form.formId, approkey: approKey, draftTp: "",
+    reDraft: "", docType: "", doc_auth: 0, pageCode: "UBAP001", appLineId: "" }, { fetch });
+  const rm = draft?.resultMap || {}, line = rm.hidAppDocLine, bind = rm.outProcessForm?.outBindData;
+  if (!Array.isArray(line) || !line.length || typeof bind !== "string" || !rm.docnumtype?.[0]?.cd_val || !draft.mainhtml) {
+    throw new GroupwareError("결재 문서 초안을 받지 못했습니다.");
+  }
+  if (str(rm.getFormData?.[0]?.form_id) !== str(form.formId)) throw new GroupwareError("결재 초안의 양식이 다릅니다.");
+  return { approKey, draft, line, refer: Array.isArray(rm.hidRefer) ? rm.hidRefer : [], bind,
+    numbering: rm.docnumtype[0].cd_val, body: fillBody(draft.mainhtml, bind) };
+}
+
+// eap110A06 as the web editor sends a new leave document (its defaults: normal level, not secret)
+function submitPayload(session, { form, title }, { approKey, draft, line, refer, bind, numbering, body }, now) {
+  const u = session.user, info = draft.ucUserInfo || {};
+  const doc = { inservice_time: "0", doc_level: "001", doc_security: "0", emergency_level: "1" };
+  const all = (keys) => Object.fromEntries(keys.map((k) => [k, "Y"]));
+  return { pageCode: "UBAP001", paramItem: { bindData: JSON.stringify(bind), interDivId: "divInterJson", interDocTp: "json",
+    doc_id: 0, form_id: form.formId, numbering_id: numbering, rep_dt: stamp(now()), repdt_mod_yn: "0",
+    co_id: u.compSeq, dept_id: u.deptSeq, biz_id: info.bizSeq || u.compSeq, user_id: u.empSeq,
+    co_nm: info.compName || "", dept_nm: info.deptName || "", user_nm: info.empName || "",
+    doc_title: title, doc_sts: "20", ...doc, use_yn: "1", approkey: approKey, contents_tp: "10",
+    doc_contents: encodeURIComponent(body), pTEAG_APPDOC_LINE: line, pVKD_TKDDITEM: [], pVCM_ATTACHFILEINFO: [],
+    pRefer: refer, pReceive: [], pOper: [], pTEAG_APPDOC_REF: [], pDraftTp: "", seal_use_yn: "", receipient: "", receipt: "",
+    iframeHtml: "", re_draft: "", modifyAppLineYn: "Y", ...all(["modifyReceive10", "modifyReceive20", "modifyReceive30",
+      "modifyReceive40", "modifyTitle", "modifyContent", "modifyRef", "modifyAttach", "modifyAddItem", "modifyInservice",
+      "modifyDoclevel", "modifyEmergency", "modifySeal", "modifyEabox"]),
+    modifyFileList: "", delFileSnList: [], auditorYn: "0",
+    modifyDocInfo: { docId: 0, appdoc: { ...doc, doc_title: title },
+      appdocReceiveList: refer.map((r) => ({ receive_div: "10", org_div: r.org_div || r.div, org_id: r.org_id })),
+      appdocLineList: line.map((l) => ({ doc_line_m_seq: l.doc_line_m_seq, doc_line_s_seq: l.doc_line_s_seq, act_id: l.act_id,
+        co_id: l.co_id, dept_id: l.dept_id, user_id: l.user_id, doc_line_gb: l.doc_line_gb })),
+      appdocFileList: [], appdocRefList: [] },
+    modifyItemList: null, isLatestVerContentsFile: true, versionCheck: null, formLang: "kr", aiVerifyHistories: [],
+    aiVerifyAutoOnSubmit: false, aiVerifyUseYn: "0", oneAiAgreeYn: info.oneAiAgreeYn || "Y" } };
+}
+
+// A saved application that has no document yet (상신대기): the employee screens have no delete for it, this
+// is the overtime form's discard
+async function discardLeave(session, { coCd, appDt, appSq }, fetch) {
+  await writeOnce(session, "/human/attendapplication/deleteSubmittedApplicationList", [{ coCd, appDt, appSq }], "근태신청 삭제",
+    { fetch });
+}
+
+export async function requestLeave(session, { kind, start, end = null, reason = "", start_time = null, confirm = false } = {},
+  { fetch, now = () => new Date() } = {}) {
+  const plan = await planLeave(session, { kind, start, end, reason, start_time }, { fetch, now });
+  if (confirm !== true) return plan.preview;
+  const [coCd, empCd] = erp(session);
+  const saved = await writeOnce(session, "/human/attendapplication/create", { coCd: "", appDt: "", appEmpCd: empCd,
+    deptCd: "", titleDc: plan.title, approLineId: "", calLinkKey: "", linkKey: "", approState: "", fileGroup: 0,
+    employeeList: [plan.employee], version: "v2", overtimeVersion: "v2", applicationList: plan.items }, "근태신청 저장", { fetch });
+  if (!saved?.appSq || !/^\d{8}$/.test(str(saved.appDt))) throw new GroupwareError(`근태신청 저장 결과를 확인하지 못했습니다. ${CHECK}`);
+  const app = { coCd: saved.coCd || coCd, appDt: str(saved.appDt), appSq: saved.appSq };
+  const id = `${app.appDt}-${app.appSq}`, ref = `근태신청(id ${id})`;
+  // from here a re-login must not run the tool again: that would save a second application
+  let draft;
+  try {
+    draft = await linkDraft(session, plan, app, fetch);
+  } catch (e) {
+    const why = e instanceof SessionError ? "세션 끊김" : e?.message || String(e?.name);   // transport text is header-free
+    const gone = !(e instanceof SessionError) && await discardLeave(session, app, fetch).then(() => true, () => false);
+    throw new GroupwareError(gone ? `결재 문서를 만들지 못해(${why}) 저장한 근태신청을 지웠습니다.`
+      : `${ref}은 저장됐지만 결재 문서를 만들지 못했습니다(${why}). 상신대기로 남았으니 leave_cancel로 지워 주세요.`);
+  }
+  // never retried: refused, or unclear, the application may sit at 상신대기 or the document may be out
+  const unsent = (why) => new GroupwareError(`${ref}은 저장됐지만 상신 결과를 확인하지 못했습니다(${why}). leave_requests에서 `
+    + "상태를 확인해, 결재진행이 아니면 leave_cancel로 지워 주세요.");
+  let sent;
+  try {
+    sent = await request(session, "/eap/eap110A06", submitPayload(session, plan, draft, now), { fetch });
+  } catch (e) {
+    throw unsent(e instanceof SessionError ? "세션 끊김" : e?.message || String(e?.name));
+  }
+  if (!/^\d+$/.test(str(sent?.result))) throw unsent("문서 번호 없음");
+  // submitted already: a failed read-back must not repeat anything
+  const row = (await leaveRows(session, plan.first, plan.last, { fetch }).catch(() => [])).find((r) => sameApp(r, app.appDt, app.appSq));
+  return { ...plan.preview, submitted: true, id, doc_id: str(sent.result), status: row ? leaveStatus(row) : "",
+    approval_line: draft.line.map((l) => `${l.user_nm || ""}(${l.act_nm || ""})`) };
+}
+
+// a document still with its writer: the writer's, 결재진행, and no one else on the line has acted. approval_read
+// saw app_yn "0" on finished documents; an action date is what a step that acted has (live 2026-10-28)
+async function checkWithdraw(session, docId, fetch) {
+  const me = str(session.user.empSeq);
+  const st = await request(session, "/eap/eap110A98", { docId, pageCode: "UBAP002" }, { fetch });
+  if (str(st?.user_id) !== me) throw new GroupwareError("본인이 상신한 문서만 회수할 수 있습니다.");
+  if (str(st?.doc_sts) !== "30") throw new GroupwareError(`결재 진행 중인 문서가 아닙니다(상태 ${str(st?.doc_sts)}). ${CHECK}`);
+  const data = await request(session, "/eap/eap096A62", { docId }, { fetch });
+  const line = data?.lineList || data?.lineInfo;
+  if (!Array.isArray(line) || !line.length) throw new GroupwareError(`결재선을 받지 못했습니다. ${CHECK}`);
+  // the writer's own step carries the submit time; without it the dates cannot be read, so no withdraw
+  if (!line.some((l) => str(l.empSeq) === me && l.appDt)) throw new GroupwareError(`결재선의 처리 기록을 읽지 못해 회수하지 않습니다. ${CHECK}`);
+  const acted = line.filter((l) => str(l.empSeq) !== me && l.appDt);
+  if (acted.length) throw new GroupwareError(`${acted.map((l) => l.userNm).join(", ")} 님이 이미 처리해 회수할 수 없습니다. ${CHECK}`);
+}
+
+// the delete takes any document id, linked HR data with it, for good: only the writer's own 임시보관 leave document
+async function checkDelete(session, docId, fetch) {
+  const data = await request(session, "/eap/eap107A28",
+    { docIdList: docId, pageCode: "UBA1020", upperMenuNo: "1000300", menuNo: "1000500" }, { fetch });
+  const list = Array.isArray(data?.list) ? data.list : [], d = list[0] || {};
+  if (list.length !== 1 || str(d.DOC_ID) !== docId) throw new GroupwareError(`결재 문서(${docId})를 찾지 못했습니다. ${CHECK}`);
+  if (!str(d.FORM_D_TP).startsWith(LEAVE_FORM) || str(d.USER_ID) !== str(session.user.empSeq) || str(d.DOC_STS) !== "10") {
+    throw new GroupwareError(`본인의 임시보관 근태 문서만 삭제할 수 있습니다. ${CHECK}`);
+  }
+}
+
+// a GET answered as server-sent events; the reply also carries session token parts, so only failCnt is read
+async function deleteDoc(session, docId, fetch) {
+  const out = await writeOnce(session, `/eap/sse/eap107A25?docIdList=${docId}`, null, "결재 문서 삭제", { fetch, get: true });
+  if (num(out?.failCnt) > 0) throw new GroupwareError(`결재 문서를 삭제하지 못했습니다. ${CHECK}`);
+}
+
+const CANCEL = { 0: "결재 전 문서를 회수한 뒤 삭제합니다.", 5: "임시보관 문서를 삭제합니다.", 2: "결재 문서 없이 저장만 된 신청을 지웁니다." };
+
+export async function cancelLeave(session, { id, confirm = false } = {}, { fetch } = {}) {
+  const [coCd, empCd] = erp(session);
+  const m = /^(\d{8})-(\d+)$/.exec(String(id ?? "").trim());
+  if (!m) throw new GroupwareError("id에는 leave_requests의 id('YYYYMMDD-번호')를 넣어 주세요.");
+  const [, appDt, appSq] = m;
+  const info = await request(session, "/human/hrd0220/selectAttendApplicationInfo", { appDt, appSq: Number(appSq) }, { fetch });
+  const master = info?.attendApplicationMaster || {};
+  const days = (info?.attendApplicationDetailList || []).map((d) => str(d.atDt)).filter((d) => /^\d{8}$/.test(d)).sort();
+  if (str(master.appSq) !== appSq || !days.length) throw new GroupwareError(`근태신청(id ${id})을 찾을 수 없습니다.`);
+  if (str(master.appEmpCd) !== str(empCd)) throw new GroupwareError("본인이 신청한 근태만 취소할 수 있습니다.");
+  const first = days[0], last = days[days.length - 1];
+  const row = (await leaveRows(session, first, last, { fetch })).find((r) => sameApp(r, appDt, appSq));
+  if (!row) throw new GroupwareError(`근태신청(id ${id})을 찾을 수 없습니다.`);
+  if (row.linkAtCd !== LEAVE) throw new GroupwareError("연차·반차·반반차 신청만 취소할 수 있습니다.");
+  // a cancel form in flight, or the leave it cancels: never tried here
+  if (str(row.reportCancYn) === "Y" || String(row.cancellationApplication) === "true") {
+    throw new GroupwareError(`결재취소가 걸린 신청은 그룹웨어에서 처리해 주세요. ${CHECK}`);
+  }
+  const state = str(row.approState), docId = str(row.idDoc), status = leaveStatus(row);
+  if (state === "1") throw new GroupwareError("결재가 끝난 신청은 그룹웨어 근태신청에서 결재취소(취소 신청서 상신)로 취소해 주세요.");
+  if (!Object.hasOwn(CANCEL, state)) throw new GroupwareError(`${status} 상태의 신청은 취소할 수 없습니다. ${CHECK}`);
+  if (state !== "2" && !/^\d+$/.test(docId)) throw new GroupwareError(`결재 문서 번호를 받지 못했습니다. ${CHECK}`);
+  if (state === "0") await checkWithdraw(session, docId, fetch);
+  if (state === "5") await checkDelete(session, docId, fetch);
+  const preview = { id, kind: row.atItemNm || row.atCdNm || row.atNm || "", start: fmtDate(first), end: fmtDate(last),
+    title: master.titleDc || "", status, action: `${CANCEL[state]} 되돌릴 수 없습니다.` };
+  if (confirm !== true) return preview;
+  if (state === "2") {
+    await discardLeave(session, { coCd, appDt, appSq: Number(appSq) }, fetch);   // as the save's discard sends it (live)
+  } else if (state === "5") {
+    await deleteDoc(session, docId, fetch);
+  } else {
+    const back = await writeOnce(session, "/eap/eap110A20", { docID: docId, pageCode: "UBAP002" }, "결재 문서 회수", { fetch });
+    if (num(back?.returnValue) !== 1) throw new GroupwareError(`회수 결과를 확인하지 못했습니다. ${CHECK}`);
+    // withdrawn: from here a re-login must not run the tool again, and the person must hear where the document is
+    try {
+      await checkDelete(session, docId, fetch);   // now 임시보관, or stop before the delete
+      await deleteDoc(session, docId, fetch);
+    } catch (e) {
+      const why = e instanceof SessionError ? "세션 끊김" : e?.message || String(e?.name);
+      throw new GroupwareError(`결재 문서를 회수해 임시보관으로 옮겼지만 삭제하지 못했습니다(${why}). leave_cancel을 다시 부르면 삭제합니다.`);
+    }
+  }
+  // done already: a failed check must not repeat it
+  const rows = await leaveRows(session, first, last, { fetch }).catch(() => null);
+  if (rows === null) throw new GroupwareError(`취소 결과를 확인하지 못했습니다. ${CHECK}`);
+  if (rows.some((r) => sameApp(r, appDt, appSq) && str(r.approState) !== "-3")) {
+    throw new GroupwareError(`취소한 뒤에도 신청이 남아 있습니다. ${CHECK}`);
+  }
+  return { ...preview, canceled: true };
 }

@@ -79,6 +79,25 @@ test("a FormData body goes as multipart, and full hands back the whole reply unc
   await assert.rejects(request(SESSION, "/mail/mail014A04", form, { fetch }), GroupwareError);   // without full, 1 is a failure
 });
 
+test("a get is a signed GET of the query whose server-sent data line is the reply", async (t) => {
+  captureStderr(t);
+  const seen = [];
+  const fetch = async (url, init) => {
+    seen.push({ url, init });
+    return new Response('data:{"resultCode":0,"resultData":{"failCnt":0,"returnValue":1}}\n\n');
+  };
+  assert.deepEqual(await request(SESSION, "/eap/sse/eap107A25?docIdList=7", null, { fetch, get: true }),
+    { failCnt: 0, returnValue: 1 });
+  const [{ url, init }] = seen;
+  assert.equal(url, `${BASE}/eap/sse/eap107A25?docIdList=7`);
+  assert.equal(init.method, "GET");
+  assert.equal(init.body, undefined);
+  assert.equal(init.headers.accept, "text/event-stream");
+  assert.equal(init.headers["content-type"], undefined);
+  assert.equal(init.headers["wehago-sign"],
+    sign(SIGN_KEY, TOKEN, init.headers["transaction-id"], init.headers.timestamp, "/eap/sse/eap107A25"));
+});
+
 test("request maps failures like the python client", async (t) => {
   captureStderr(t);
   const cases = [

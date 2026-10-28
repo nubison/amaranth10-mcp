@@ -166,7 +166,7 @@ test("server mode writes nothing but MCP frames to stdout", async () => {
   await client.connect(transport);
   try {
     assert.equal(client.getServerVersion().version, VERSION);
-    assert.equal((await client.listTools()).tools.length, 28);
+    assert.equal((await client.listTools()).tools.length, 30);
     const out = await client.callTool({ name: "alerts", arguments: {} });
     assert.equal(out.isError, true);
     assert.match(texts(out)[0][1], /^그룹웨어에 연결하지 못했습니다/);

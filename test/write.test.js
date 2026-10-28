@@ -4,8 +4,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import { GroupwareError, SessionError } from "../src/client.js";
-import { cancelReservation, createSchedule, deleteMail, deleteSchedule, markMail, reserveResource, sendMail,
-  updateReservation, updateSchedule } from "../src/write.js";
+import { cancelLeave, cancelReservation, createSchedule, deleteMail, deleteSchedule, fillBody, markMail, requestLeave,
+  reserveResource, sendMail, updateReservation, updateSchedule } from "../src/write.js";
 
 const RES = { base: "https://gw.example.com", token: "G1|E1|R1", signKey: "test-sign-key",
   user: { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", empSeq: "E1" } };
@@ -15,9 +15,10 @@ const COMPANY = { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", emailAddr: "",
 function fake(handler) {
   const calls = [];
   const fetch = async (url, init) => {
-    const path = new URL(url).pathname;
-    const body = init.body instanceof FormData ? Object.fromEntries(init.body) : JSON.parse(init.body);
-    calls.push({ path, body });
+    const { pathname: path, search } = new URL(url);
+    const body = init.body === undefined ? null   // a GET
+      : init.body instanceof FormData ? Object.fromEntries(init.body) : JSON.parse(init.body);
+    calls.push(search ? { path, body, query: search } : { path, body });
     const out = handler(path, body, calls);
     return out instanceof Response ? out : new Response(JSON.stringify({ resultCode: 0, resultData: out ?? null }));
   };
@@ -1014,4 +1015,263 @@ test("mark: unread by default, read when asked, in the mail's folder", async () 
   assert.deepEqual(bodyOf(api, "mail002A15"), { mbox: "INBOX", uids: "9,10", type: "unseen" });
   await markMail(MAILER, { muids: [9], box: "INBOX", read: true }, { fetch: api.fetch });
   assert.deepEqual(api.calls.filter((c) => c.path.endsWith("mail002A15")).map((c) => c.body.type), ["unseen", "seen"]);
+});
+
+// ---- leave_request
+const HR = { ...RES, user: { ...RES.user, erpCoCd: "1000", erpEmpCd: "123" } };
+const CODES = [
+  { atCd: "1101", atNm: "연차", linkAtCd: "1010", timeSetFg: "ALL", outProcessId: "HP_HPD0110_00011", useYn: "Y" },
+  { atCd: "1111", atNm: "반반차", linkAtCd: "1010", timeSetFg: "NA", outProcessId: "HP_HPD0110_00011", useYn: "Y" },
+  { atCd: "1302", atNm: "기타휴가", linkAtCd: "1030", timeSetFg: "NA", outProcessId: "HP_HPD0110_00013", useYn: "Y" }];
+const span = (a, b = a) => ({ atDt: a, startDt: a, endDt: b, startTm: "0900", endTm: "1800", appDy: "1", appTm: 480, ycUseCnt: 1 });
+const BIND = JSON.stringify({ ITEMS: { appYear: "2026" },
+  TABLE: { dbTable1: { group: [{ items: { empNm: "홍길동" }, group: [{ items: { atCdNm: "연차", appRmkDc: "<가족 여행>" } }] }] } } });
+const MAIN = '<meta charset="utf-8"><style>* {margin:0;}</style><p><input class="dze_external_data_area" mapping_key="appYear">년 '
+  + '<input mapping_key="empNm" type="text"> <input mapping_key="atCdNm"> <input mapping_key="appRmkDc"></p>';
+const LINE = [
+  { user_nm: "홍길동", act_nm: "결재", doc_line_m_seq: 1, doc_line_s_seq: 1, act_id: "A1", co_id: "1000", dept_id: "D1", user_id: "E1", doc_line_gb: "1" },
+  { user_nm: "김팀장", act_nm: "결재", doc_line_m_seq: 2, doc_line_s_seq: 1, act_id: "A1", co_id: "1000", dept_id: "D1", user_id: "E9", doc_line_gb: "1" }];
+const WRITE_STEPS = ["create", "GetLinkKey", "SetEnageGroup", "saveLinkKey", "eap110A06", "deleteSubmittedApplicationList"];
+const writes = (api) => api.paths().map((p) => p.split("/").pop()).filter((n) => WRITE_STEPS.includes(n));
+
+function leaveApi({ spans = [span("20261216")], fail = {} } = {}) {
+  return fake((path, body) => {
+    const name = path.split("/").pop();
+    if (fail[name]) return fail[name](body);
+    switch (name) {
+      case "getApplicationBaseInfo": return { attendCodeList: CODES,
+        employee: { coCd: "1000", empCd: "123", deptCd: "D10", korNm: "홍길동", rsrgNo: "RRN-SECRET", brthDt: "BIRTH-SECRET" } };
+      case "getStartTmEndTmByWorkType": return { startTm: "0900", endTm: "1800", workTp: "1" };
+      case "calculateApplicationDays": return { deptNm: "개발팀", empNm: "홍길동", ycUseCnt: spans.length ? 1 : 0, applicationDaysCnt: 1,
+        applicationMinutes: 480, dailyAppTm: 480, dailyCalculatedTimeYcUseCnt: 1, holidayExclusionApplicationList: spans };
+      case "validateNew": return { duplicateSubmittedApplicationDetails: [], insufficientAnnualLeaveList: [] };
+      case "0hr00011": return "[개발팀 홍길동] 12-16 연차신청서";
+      case "eap096A45": return [{ formDTp: "HP_HPD0110_00012", formId: 2037 },
+        { formDTp: "HP_HPD0110_00011", formId: 2036, formNm: "연차휴가신청서" }];
+      case "getAnnualLeaveInfoOfEmployee": return { unusedCnt: 10 };
+      case "create": return { appSq: 501, coCd: "1000", appDt: "20261028" };
+      case "GetLinkKey": return { approKey: body.approKey, linkKey: "LINK-1" };
+      case "saveLinkKey": return 1;
+      case "eap110A03": return { mainhtml: MAIN, ucUserInfo: { compName: "회사", deptName: "개발팀", empName: "홍길동",
+        oauth_token: "TOKEN-SECRET" }, resultMap: { hidAppDocLine: LINE, hidRefer: [{ div: "d", org_id: "D20" }],
+        outProcessForm: { outBindData: BIND }, docnumtype: [{ cd_val: "1001" }], getFormData: [{ form_id: 2036 }] } };
+      case "eap110A06": return { result: 1004400 };
+      // the same appSq under another application date is a different application
+      case "at00001": return [{ appSq: 501, appDt: "20260101", approState: "5" }, { appSq: 501, appDt: "20261028", approState: "0" }];
+      default: return {};
+    }
+  });
+}
+const ask = (api, args = {}, opts = {}) => requestLeave(HR, { kind: "연차", start: "2026-12-16", reason: "가족 여행", ...args },
+  { fetch: api.fetch, now: () => new Date(2026, 9, 28, 9, 30, 5), ...opts });
+const PREVIEW = { kind: "연차", start: "2026-12-16", end: "2026-12-16", time: "09:00~18:00", days: 1, remaining_after: 9,
+  title: "[개발팀 홍길동] 12-16 연차신청서", reason: "가족 여행", approval: "그룹웨어 기본 결재선으로 상신하며, 결재자에게 알림이 갑니다." };
+
+test("leave request: a preview reads only and keeps the employee's private fields in", async () => {
+  const api = leaveApi();
+  assert.deepEqual(await ask(api), PREVIEW);
+  assert.deepEqual(writes(api), []);
+  const item = bodyOf(api, "validateNew").newItem;
+  assert.deepEqual([item.atCd, item.startDt, item.endDt, item.startTm, item.endTm, item.atDt, item.ycUseCnt],
+    ["1101", "20261216", "20261216", "0900", "1800", "20261028", 1]);
+  assert.ok(!/SECRET/.test(JSON.stringify(api.calls)));
+  for (const confirm of NOT_TRUE) {
+    const again = leaveApi();
+    await ask(again, { confirm });
+    assert.deepEqual(writes(again), []);
+  }
+});
+
+test("leave request: 반반차 is two hours from start_time", async () => {
+  const api = leaveApi();
+  const out = await ask(api, { kind: "반반차", start_time: "16:00" });
+  assert.equal(out.time, "16:00~18:00");
+  assert.deepEqual([bodyOf(api, "calculateApplicationDays").startTime, bodyOf(api, "calculateApplicationDays").endTime], ["1600", "1800"]);
+  for (const start_time of [null, "4pm", "16:75", "23:00"]) {
+    await assert.rejects(ask(leaveApi(), { kind: "반반차", start_time }), rejectsWith(/start_time/));
+  }
+});
+
+test("leave request: what it cannot ask for stops before any write", async () => {
+  const cases = [
+    [{ kind: "기타휴가" }, {}, /kind는 연차·반반차 중 하나/],
+    [{ start: "2026-12-22", end: "2026-12-18" }, {}, /시작일\(2026-12-22\)이 종료일/],
+    [{}, { spans: [] }, /근무일이 없습니다/],
+    [{ end: "2026-12-22" }, { spans: [span("20261218"), span("20261221", "20261222")] }, /2026-12-18, 2026-12-21~2026-12-22로 나눠/],
+    [{}, { fail: { validateNew: () => new Response(JSON.stringify({ resultCode: 22028, resultMsg: null })) } }, /이미 신청한 근태/],
+    [{}, { fail: { validateNew: () => new Response(JSON.stringify({ resultCode: 22023, resultMsg: "Insufficient" })) } }, /연차가 부족/],
+    [{}, { fail: { validateNew: () => new Response(JSON.stringify({ resultCode: 22099, resultMsg: "마감" })) } }, /신청할 수 없습니다\(마감\)/],
+    [{}, { fail: { validateNew: () => ({ annualLeaveClosedList: [{}] }) } }, /annualLeaveClosedList/],
+    [{}, { fail: { eap096A45: () => [] } }, /결재 양식\(HP_HPD0110_00011\)을 찾지 못했습니다/],
+  ];
+  for (const [args, opts, re] of cases) {
+    const api = leaveApi(opts);
+    await assert.rejects(ask(api, { ...args, confirm: true }), rejectsWith(re));
+    assert.deepEqual(writes(api), []);
+  }
+});
+
+test("leave request: confirm saves, links and submits once each, in order", async () => {
+  const api = leaveApi();
+  const out = await ask(api, { confirm: true });
+  assert.deepEqual(out, { ...PREVIEW, submitted: true, id: "20261028-501", doc_id: "1004400", status: "결재진행",
+    approval_line: ["홍길동(결재)", "김팀장(결재)"] });
+  assert.deepEqual(writes(api), WRITE_STEPS.slice(0, 5));
+  const created = bodyOf(api, "create");
+  assert.deepEqual([created.appEmpCd, created.titleDc, created.applicationList.length], ["123", PREVIEW.title, 1]);
+  assert.deepEqual(created.applicationList[0], { ...span("20261216"), coCd: "1000", empCd: "123", deptCd: "D10",
+    deptNm: "개발팀", empNm: "홍길동", appRmkDc: "가족 여행" });
+  const { approKey } = bodyOf(api, "SetEnageGroup");
+  assert.match(approKey, /^ERP_[0-9a-f-]{36}$/);
+  assert.deepEqual(bodyOf(api, "saveLinkKey"), { linkKey: "LINK-1", appSq: 501, coCd: "1000", appDt: "20261028" });
+  const p = bodyOf(api, "eap110A06").paramItem;
+  assert.equal(p.approkey, approKey);
+  assert.equal(JSON.parse(p.bindData), BIND);   // the bound data as a string inside the string
+  assert.deepEqual([p.form_id, p.numbering_id, p.rep_dt, p.doc_sts, p.co_nm, p.user_id], [2036, "1001", "2026-10-28 09:30:05", "20", "회사", "E1"]);
+  assert.equal(decodeURIComponent(p.doc_contents), '<head><meta charset="utf-8"><style>* {margin:0;}</style>\n</head><body>'
+    + "<p>2026년 홍길동 연차 &lt;가족 여행&gt;</p></body>");
+  assert.deepEqual(p.modifyDocInfo.appdocLineList.map((l) => [l.doc_line_m_seq, l.user_id]), [[1, "E1"], [2, "E9"]]);
+  assert.deepEqual(p.modifyDocInfo.appdocReceiveList, [{ receive_div: "10", org_div: "d", org_id: "D20" }]);
+  assert.ok(!/SECRET/.test(JSON.stringify(api.calls)));
+});
+
+test("leave request: a failure before the submit discards the saved application", async () => {
+  const api = leaveApi({ fail: { GetLinkKey: timesOut } });
+  await assert.rejects(ask(api, { confirm: true }), rejectsWith(/^결재 문서를 만들지 못해.*저장한 근태신청을 지웠습니다/));
+  assert.deepEqual(writes(api), ["create", "GetLinkKey", "deleteSubmittedApplicationList"]);
+  assert.deepEqual(bodyOf(api, "deleteSubmittedApplicationList"), [{ coCd: "1000", appDt: "20261028", appSq: 501 }]);
+  const stuck = leaveApi({ fail: { saveLinkKey: () => 0, deleteSubmittedApplicationList: timesOut } });
+  await assert.rejects(ask(stuck, { confirm: true }), rejectsWith(/id 20261028-501.*잇지 못했습니다.*상신대기로 남았으니 leave_cancel/));
+  assert.equal(count(stuck, "eap110A06"), 0);
+});
+
+test("leave request: a session lost after the save is not run again and leaves the application", async () => {
+  const api = leaveApi({ fail: { SetEnageGroup: unauthorized } });
+  const e = await ask(api, { confirm: true }).catch((x) => x);
+  assert.ok(e instanceof GroupwareError && !(e instanceof SessionError));   // a SessionError would re-run the tool
+  assert.match(e.message, /id 20261028-501.*세션 끊김/);
+  assert.deepEqual(writes(api), ["create", "GetLinkKey", "SetEnageGroup"]);
+  // the save itself may be refused by an expired session: that one is safe to run again
+  await assert.rejects(ask(leaveApi({ fail: { create: unauthorized } }), { confirm: true }), SessionError);
+});
+
+test("leave request: an unclear submit says to check and never discards", async () => {
+  for (const fail of [timesOut, unauthorized, () => ({ result: null })]) {
+    const api = leaveApi({ fail: { eap110A06: fail } });
+    await assert.rejects(ask(api, { confirm: true }), rejectsWith(/id 20261028-501.*상신 결과를 확인하지 못했습니다.*leave_cancel로/));
+    assert.deepEqual(writes(api), WRITE_STEPS.slice(0, 5));
+  }
+});
+
+test("fillBody fills every field and stops at one without a value", () => {
+  assert.match(fillBody(MAIN, BIND), /<p>2026년 홍길동 연차 &lt;가족 여행&gt;<\/p><\/body>$/);
+  assert.throws(() => fillBody(`${MAIN}<input mapping_key="usedCnt">`, BIND), rejectsWith(/usedCnt/));
+});
+
+// ---- leave_cancel
+const INFO = { attendApplicationMaster: { appSq: "501", appDt: "20261028", appEmpCd: "123", titleDc: "연차신청서" },
+  attendApplicationDetailList: [{ atDt: "20261216" }] };
+const ROW = { appSq: "501", appDt: "20261028", coCd: "1000", linkAtCd: "1010", atNm: "연차", approState: "0", idDoc: "1004400" };
+const ME_STEP = { empSeq: "E1", userNm: "홍길동", appDt: "2026-10-28 09:30" };
+
+function withdrawApi({ row = ROW, rows = null, info = INFO, a98 = { doc_sts: "30", user_id: "E1" }, line = [ME_STEP, { empSeq: "E9", userNm: "김팀장", appDt: "" }],
+  doc = { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E1", DOC_STS: "10" }, stays = false } = {}) {
+  let done = false;
+  return fake((path) => {
+    const name = path.split("/").pop();
+    if (name === "selectAttendApplicationInfo") return info;
+    if (name === "at00001") return done && !stays ? [] : rows || [row];
+    if (name === "eap110A98") return a98;
+    if (name === "eap096A62") return { lineList: line };
+    if (name === "eap107A28") return { list: doc ? [doc] : [] };
+    if (name === "eap110A20") return { returnValue: 1 };
+    if (["eap107A25", "deleteSubmittedApplicationList"].includes(name)) { done = true; return { failCnt: 0 }; }
+    return {};
+  });
+}
+const CANCEL_WRITES = ["eap110A20", "eap107A25", "deleteSubmittedApplicationList"];
+const cancelWrites = (api) => api.paths().map((p) => p.split("/").pop()).filter((n) => CANCEL_WRITES.includes(n));
+const cancelOf = (api, args = {}) => cancelLeave(HR, { id: "20261028-501", ...args }, { fetch: api.fetch });
+
+test("leave cancel: 결재진행 is checked in the preview, then withdrawn and deleted", async () => {
+  const api = withdrawApi();
+  const preview = { id: "20261028-501", kind: "연차", start: "2026-12-16", end: "2026-12-16", title: "연차신청서", status: "결재진행",
+    action: "결재 전 문서를 회수한 뒤 삭제합니다. 되돌릴 수 없습니다." };
+  assert.deepEqual(await cancelOf(api), preview);
+  assert.deepEqual(cancelWrites(api), []);
+  const run = withdrawApi();
+  assert.deepEqual(await cancelOf(run, { confirm: true }), { ...preview, canceled: true });
+  assert.deepEqual(cancelWrites(run), ["eap110A20", "eap107A25"]);
+  assert.deepEqual(bodyOf(run, "eap110A20"), { docID: "1004400", pageCode: "UBAP002" });
+  const del = run.calls.find((c) => c.path.endsWith("eap107A25"));
+  assert.deepEqual([del.query, del.body], ["?docIdList=1004400", null]);
+  assert.ok(run.paths().indexOf("/eap/eap107A28") > run.paths().indexOf("/eap/eap110A20"));   // re-checked once withdrawn
+});
+
+test("leave cancel: refused before any write", async () => {
+  const cases = [
+    [{}, "501", /leave_requests의 id/],
+    [{ info: { attendApplicationMaster: {}, attendApplicationDetailList: [] } }, undefined, /찾을 수 없습니다/],
+    [{ info: { ...INFO, attendApplicationMaster: { ...INFO.attendApplicationMaster, appEmpCd: "999" } } }, undefined, /본인이 신청한/],
+    [{ row: { ...ROW, linkAtCd: "1030" } }, undefined, /연차·반차·반반차 신청만/],
+    [{ row: { ...ROW, approState: "1" } }, undefined, /결재가 끝난 신청은 그룹웨어/],
+    [{ row: { ...ROW, approState: "4" } }, undefined, /결재반려 상태의 신청은 취소할 수 없습니다/],
+    [{ row: { ...ROW, idDoc: null } }, undefined, /결재 문서 번호/],
+    [{ a98: { doc_sts: "90", user_id: "E1" } }, undefined, /결재 진행 중인 문서가 아닙니다/],
+    [{ a98: { doc_sts: "30", user_id: "E9" } }, undefined, /본인이 상신한/],
+    [{ line: [ME_STEP, { empSeq: "E9", userNm: "김팀장", appDt: "2026-10-28 10:00" }] }, undefined, /김팀장 님이 이미 처리/],
+    [{ line: [] }, undefined, /결재선을 받지 못했습니다/],
+    [{ line: [{ ...ME_STEP, appDt: "" }, { empSeq: "E9", userNm: "김팀장", appDt: "" }] }, undefined, /처리 기록을 읽지 못해/],
+    [{ row: { ...ROW, reportCancYn: "Y" } }, undefined, /결재취소가 걸린/],
+    [{ row: { ...ROW, cancellationApplication: true } }, undefined, /결재취소가 걸린/],
+    [{ row: { ...ROW, approState: "5" }, doc: null }, undefined, /찾지 못했습니다/],
+    [{ row: { ...ROW, approState: "5" }, doc: { DOC_ID: 1004400, FORM_D_TP: "EA_GENERAL", USER_ID: "E1", DOC_STS: "10" } }, undefined, /본인의 임시보관 근태 문서만/],
+    [{ row: { ...ROW, approState: "5" }, doc: { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E9", DOC_STS: "10" } }, undefined, /본인의 임시보관/],
+    [{ row: { ...ROW, approState: "5" }, doc: { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E1", DOC_STS: "30" } }, undefined, /본인의 임시보관/],
+  ];
+  for (const [opts, id, re] of cases) {
+    const api = withdrawApi(opts);
+    await assert.rejects(cancelOf(api, { ...(id === undefined ? {} : { id }), confirm: true }), rejectsWith(re));
+    assert.deepEqual(cancelWrites(api), []);
+  }
+});
+
+test("leave cancel: 임시보관 is deleted and 상신대기 discarded", async () => {
+  const kept = withdrawApi({ row: { ...ROW, approState: "5" } });
+  assert.equal((await cancelOf(kept, { confirm: true })).canceled, true);
+  assert.deepEqual(cancelWrites(kept), ["eap107A25"]);
+  const saved = withdrawApi({ row: { ...ROW, approState: "2", idDoc: null } });
+  assert.equal((await cancelOf(saved, { confirm: true })).canceled, true);
+  assert.deepEqual(bodyOf(saved, "deleteSubmittedApplicationList"), [{ coCd: "1000", appDt: "20261028", appSq: 501 }]);
+});
+
+test("leave cancel: still listed afterwards, or a delete that fails, is an error and not repeated", async () => {
+  const api = withdrawApi({ stays: true });
+  await assert.rejects(cancelOf(api, { confirm: true }), rejectsWith(/남아 있습니다/));
+  assert.deepEqual(cancelWrites(api), ["eap110A20", "eap107A25"]);
+  const { fetch } = withdrawApi({ row: { ...ROW, approState: "5" } });
+  const failing = async (url, init) => (url.includes("eap107A25")
+    ? new Response(JSON.stringify({ resultCode: 0, resultData: { failCnt: 1 } })) : fetch(url, init));
+  const calls = [];
+  const counted = async (url, init) => { calls.push(url); return failing(url, init); };
+  await assert.rejects(cancelLeave(HR, { id: "20261028-501", confirm: true }, { fetch: counted }), rejectsWith(/삭제하지 못했습니다/));
+  assert.equal(calls.filter((u) => u.includes("eap107A25")).length, 1);
+});
+
+test("leave cancel: the same appSq under another application date is not this one", async () => {
+  const api = withdrawApi({ rows: [{ ...ROW, appDt: "20261001", idDoc: "999", approState: "5" }, ROW] });
+  assert.equal((await cancelOf(api, { confirm: true })).status, "결재진행");
+  assert.equal(bodyOf(api, "eap110A20").docID, "1004400");
+  assert.deepEqual(api.calls.filter((c) => c.query).map((c) => c.query), ["?docIdList=1004400"]);
+});
+
+test("leave cancel: once withdrawn, a failed delete says where the document is and is not run again", async () => {
+  const stuck = withdrawApi({ doc: { DOC_ID: 1004400, FORM_D_TP: "HP_HPD0110_00011", USER_ID: "E1", DOC_STS: "30" } });
+  await assert.rejects(cancelOf(stuck, { confirm: true }), rejectsWith(/회수해 임시보관으로 옮겼지만 삭제하지 못했습니다.*leave_cancel을 다시/));
+  assert.deepEqual(cancelWrites(stuck), ["eap110A20"]);
+  const { fetch } = withdrawApi();
+  const expired = async (url, init) => (url.includes("eap107A25") ? new Response("", { status: 401 }) : fetch(url, init));
+  const e = await cancelLeave(HR, { id: "20261028-501", confirm: true }, { fetch: expired }).catch((x) => x);
+  assert.ok(e instanceof GroupwareError && !(e instanceof SessionError));   // a SessionError would re-run the tool
+  assert.match(e.message, /회수해 임시보관으로 옮겼지만.*세션 끊김/);
 });

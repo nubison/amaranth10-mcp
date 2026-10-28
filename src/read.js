@@ -110,7 +110,7 @@ export function fmtStamp(s) {
   const d = String(s ?? "").replace(/\D/g, "");
   return d.length < 12 ? "" : `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)} ${d.slice(8, 10)}:${d.slice(10, 12)}`;
 }
-const fmtDate = (ymd) => {
+export const fmtDate = (ymd) => {
   const d = String(ymd ?? "").replace(/\D/g, "");
   return d.length >= 8 ? `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}` : "";
 };
@@ -130,7 +130,7 @@ function inOrder(first, last) {
   return [first, last];
 }
 const pad = (n) => String(n).padStart(2, "0");
-const ymdOf = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;   // local time, like datetime.now()
+export const ymdOf = (d) => `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}`;   // local time, like datetime.now()
 // Python's float(): "-", "----", "" and null are the API's empties and read as 0
 export const num = (v) => {
   if (typeof v === "number" || typeof v === "boolean") return Number(v);
@@ -337,17 +337,28 @@ export async function fetchLeaveBalance(session, _args = {}, { fetch, now = () =
     compensation: bucket("compensation"), substitute: bucket("substitute") };
 }
 
-// 1 seen live (all 종결 in EAP); 2 and 5 from the web client; others pass through
-const LEAVE_STATUS = { 1: "결재완료", 2: "결재 문서 없음", 5: "임시보관" };
+// the web client's names (its list screen and APPRO_STATE); 1 seen live, the rest pass through as named there
+const LEAVE_STATUS = { "-3": "문서삭제", "-1": "반려취소", 0: "결재진행", 1: "결재완료", 2: "상신대기", 3: "보류", 4: "결재반려",
+  5: "임시보관" };
+export const leaveStatus = (r) => r.approStateNm
+  || (has(LEAVE_STATUS, String(r.approState)) ? LEAVE_STATUS[String(r.approState)] : r.approState || "");
+
+/** The employee's own attendance applications whose days fall in first..last (YYYYMMDD), one row per stretch. */
+export async function leaveRows(session, first, last, { fetch } = {}) {
+  const [coCd, empCd] = erp(session);
+  // live 2026-10-28: "" listed 결재완료 only; the web calendar asks "0,1,4,5", and 2 adds 상신대기
+  const rows = await request(session, "/human/attendapplication/at00001",
+    { employeeList: [{ coCd, empCd }], startDate: first, endDate: last, approState: "0,1,2,4,5", linkKey: "" }, { fetch });
+  return Array.isArray(rows) ? rows : [];
+}
 
 export async function fetchLeaveRequests(session, { start = null, end = null } = {}, { fetch, now = () => new Date() } = {}) {
-  const [coCd, empCd] = erp(session);
   const year = now().getFullYear();
   const [first, last] = inOrder(start ? toApiDay(start) : `${year}0101`, end ? toApiDay(end) : `${year}1231`);
-  const rows = await request(session, "/human/attendapplication/at00001",
-    { employeeList: [{ coCd, empCd }], startDate: first, endDate: last, approState: "", linkKey: "" }, { fetch });
+  const rows = await leaveRows(session, first, last, { fetch });
   // allowlist: linkKey and approKey are the HR system's internal keys and stay here
-  return (Array.isArray(rows) ? rows : []).map((r) => ({
+  return rows.map((r) => ({
+    id: `${r.appDt}-${r.appSq}`,   // the application, for leave_cancel; its stretches share it
     type: r.atItemNm || r.atCdNm || "",
     start: fmtDate(r.startDt),
     end: fmtDate(r.endDt),
@@ -356,7 +367,7 @@ export async function fetchLeaveRequests(session, { start = null, end = null } =
     time: /^\d{4}$/.test(r.startTm) && /^\d{4}$/.test(r.endTm)
       ? `${r.startTm.slice(0, 2)}:${r.startTm.slice(2)}~${r.endTm.slice(0, 2)}:${r.endTm.slice(2)}` : "",
     reason: r.appRmkDc || "",
-    status: r.approStateNm || (has(LEAVE_STATUS, String(r.approState)) ? LEAVE_STATUS[String(r.approState)] : r.approState || ""),
+    status: leaveStatus(r),
     doc_id: r.idDoc ?? null,   // an e-approval document id, for approval_read
     canceled: String(r.reportCancYn) === "Y",
   }));

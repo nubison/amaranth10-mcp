@@ -81,10 +81,10 @@ for (const [id, user] of NO_ERP) {
 
 // ---- leave requests
 // live shape: appTm is the time applied for in minutes, startTm/endTm "HHMM"
-const LEAVE_ROW = { appSq: 31, atItemNm: "연차", atCdNm: "연차(종일)", startDt: "20260923", endDt: "20260923",
+const LEAVE_ROW = { appDt: "20260922", appSq: 31, atItemNm: "연차", atCdNm: "연차(종일)", startDt: "20260923", endDt: "20260923",
   appTm: 240, startTm: "0900", endTm: "1300", ycUseCnt: 0.5, appRmkDc: "추석 전날 오전근무", approStateNm: null,
   approState: "1", idDoc: "1002770", reportCancYn: "N", linkKey: "LINK-SECRET", approKey: "APPRO-SECRET" };
-const leaveOut = { type: "연차", start: "2026-09-23", end: "2026-09-23", days: 0.5, hours: 4, time: "09:00~13:00",
+const leaveOut = { id: "20260922-31", type: "연차", start: "2026-09-23", end: "2026-09-23", days: 0.5, hours: 4, time: "09:00~13:00",
   reason: "추석 전날 오전근무", status: "결재완료", doc_id: "1002770", canceled: false };
 
 test("fetchLeaveRequests request and fields", async () => {
@@ -92,19 +92,20 @@ test("fetchLeaveRequests request and fields", async () => {
   const rows = [LEAVE_ROW,
     { ...LEAVE_ROW, atItemNm: null, approState: "9", idDoc: null, reportCancYn: "Y", ycUseCnt: "-" },
     { ...LEAVE_ROW, approStateNm: "반려" },   // the name wins over the code "1"
-    { ...LEAVE_ROW, approState: "2" }, { ...LEAVE_ROW, approState: "5" }, noState];
+    { ...LEAVE_ROW, approState: "2" }, { ...LEAVE_ROW, approState: "5" }, noState, { ...LEAVE_ROW, approState: 0 }];
   const { fetch, calls } = fake(() => rows);
   const out = await fetchLeaveRequests(HR, { start: "2026-09-01", end: "2026-09-30" }, { fetch });
   assert.deepEqual(calls, [{ path: "/human/attendapplication/at00001", body: {
     employeeList: [{ coCd: "1000", empCd: "123" }], startDate: "20260901", endDate: "20260930",
-    approState: "", linkKey: "" } }]);
+    approState: "0,1,2,4,5", linkKey: "" } }]);
   assert.deepEqual(out, [
     leaveOut,
     { ...leaveOut, type: "연차(종일)", days: 0, status: "9", doc_id: null, canceled: true },
     { ...leaveOut, status: "반려" },
-    { ...leaveOut, status: "결재 문서 없음" },
+    { ...leaveOut, status: "상신대기" },
     { ...leaveOut, status: "임시보관" },
-    { ...leaveOut, status: "" }]);
+    { ...leaveOut, status: "" },
+    { ...leaveOut, status: "결재진행" }]);   // 0 is a state, not a missing one
   assert.ok(!JSON.stringify(out).includes("SECRET"));   // linkKey and approKey stay inside
 });
 
