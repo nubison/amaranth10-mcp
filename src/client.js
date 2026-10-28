@@ -8,12 +8,8 @@ import { dirname, join } from "node:path";
 
 export const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
   + "(KHTML, like Gecko) Chrome/124.0 Safari/537.36";
-const LOGIN_PATH = "/gw/gw050A02";
-const GROUP_PATH = "/gw/gw050B01";   // the login page's pre-login lookup: host -> the company's groupSeq
-const TIMEOUT_MS = 15000;   // the Python server's httpx timeout
 
 const NO_CREDENTIALS = "그룹웨어 주소·아이디·비밀번호가 설정되지 않았습니다. README의 설치 안내대로 터미널에서 setup을 실행해 주세요.";
-const SESSION_LOST = "세션이 다시 끊겼습니다. 잠시 후 다시 요청해 주세요.";
 const rejectedText = (message) => `그룹웨어 로그인에 실패했습니다(${message}). 계정이 잠기지 않도록 같은 `
   + "아이디·비밀번호로는 다시 시도하지 않습니다. 비밀번호가 바뀌었다면 setup을 다시 실행하거나 설정에서 고쳐 주세요.";
 
@@ -27,12 +23,7 @@ export class SessionError extends Error {}
 class CredentialsError extends GroupwareError {}
 
 /** The groupware refused the id or the password (not a network or mapping failure). */
-export class LoginRejected extends GroupwareError {
-  constructor(step, message) {
-    super(message || "로그인에 실패했습니다.");
-    this.step = step;
-  }
-}
+export class LoginRejected extends GroupwareError {}
 
 // fetch's own text can echo a header, token included: keep the type name and a fixed code only
 class TransportError extends Error {
@@ -48,8 +39,8 @@ const now = () => String(Math.floor(Date.now() / 1000));
 
 async function send(fetch, url, init) {
   try {
-    // manual: httpx follows no redirect, and a redirect must not carry the token elsewhere
-    const resp = await fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(TIMEOUT_MS) });
+    // manual: a redirect must not carry the token elsewhere
+    const resp = await fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(15000) });
     return { status: resp.status, text: await resp.text() };
   } catch (e) {
     throw new TransportError(e);
@@ -58,15 +49,13 @@ async function send(fetch, url, init) {
 
 /** The groupware's https origin from "gw.example.com" or a pasted page URL; GroupwareError otherwise. */
 export function normalizeUrl(input) {
-  const text = String(input ?? "").trim();
-  let url;
+  const text = input.trim();
+  let url = null;
   try {
     url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `https://${text}`);
-  } catch {
-    url = null;
-  }
+  } catch {}
   // https only: the password and the session token go there
-  if (!url || url.protocol !== "https:" || !url.hostname || url.username || url.password) {
+  if (url?.protocol !== "https:" || url.username || url.password) {
     throw new GroupwareError("그룹웨어 주소는 https://로 시작하는 주소여야 합니다(예: https://gw.example.com).");
   }
   return url.origin;
@@ -84,21 +73,16 @@ export async function request(session, pathname, body, { fetch = globalThis.fetc
   const id = tid(), ts = now();
   const { base, token, signKey } = session;
   const headers = {
-    "user-agent": UA,
-    authorization: `Bearer ${token}`,
-    timestamp: ts,
-    "transaction-id": id,
-    "wehago-sign": sign(signKey, token, id, ts, path),
-    "access-domain": base,
+    "user-agent": UA, authorization: `Bearer ${token}`, timestamp: ts, "transaction-id": id,
+    "wehago-sign": sign(signKey, token, id, ts, path), "access-domain": base,
+    // FormData: fetch sets the multipart content-type with its boundary itself
     ...(get ? { accept: "text/event-stream" } : body instanceof FormData ? {} : { "content-type": "application/json" }),
     // the klago gateway authenticates on BIZCUBE_AT/HK, built from the token (not the jar's oAuthToken)
     cookie: `oAuthToken=${token}; signKey=${signKey}; BIZCUBE_AT=${token}; BIZCUBE_HK=${signKey}; BIZCUBE_TYPE=Web`,
-    origin: base,
-    referer: base + "/",
+    origin: base, referer: base + "/",
   };
   let outcome = "no response";
   try {
-    // FormData: fetch sets the multipart boundary itself
     const resp = await send(fetch, base + pathname, get ? { method: "GET", headers } : { method: "POST", headers,
       body: body instanceof FormData ? body : JSON.stringify(body) });
     outcome = `HTTP ${resp.status}`;
@@ -112,11 +96,10 @@ export async function request(session, pathname, body, { fetch = globalThis.fetc
     }
     if (!isObject(data)) throw new GroupwareError(`${path}: unexpected response`);
     outcome += ` resultCode=${data.resultCode}`;
-    const errors = isObject(data.errors) ? data.errors : {};
-    if (errors.code === "E002" || data.resultMsg === "SESSION_MISMATCH") throw new SessionError(`${path}: session expired`);
+    if (data.errors?.code === "E002" || data.resultMsg === "SESSION_MISMATCH") throw new SessionError(`${path}: session expired`);
     if (full) return data;
     if (!["0", "200"].includes(String(data.resultCode))) {
-      throw new GroupwareError(`${path}: ${data.resultMsg || errors.message || "error"}`);
+      throw new GroupwareError(`${path}: ${data.resultMsg || data.errors?.message || "error"}`);
     }
     return data.resultData;
   } finally {
@@ -124,8 +107,8 @@ export async function request(session, pathname, body, { fetch = globalThis.fetc
   }
 }
 
-// Before a login every POST gets its own fresh get_token, signed without a key. The login form's
-// keys and values are encoded like the web client's encodeURIComponent; raw values break passwords with &=+%#.
+// Before a login every POST gets its own fresh get_token, signed without a key. Anything but a reply
+// object (an error page, no token) is "unexpected": never echoed, and never taken for a refusal.
 async function preLoginPost(fetch, base, path, contentType, body) {
   const id = tid();
   const tok = await send(fetch, `${base}/get_token/?url=${path}`, {
@@ -136,32 +119,22 @@ async function preLoginPost(fetch, base, path, contentType, body) {
     const { token, cur_date: curDate } = JSON.parse(tok.text);
     if (typeof token !== "string" || typeof curDate !== "string") throw new Error();
     signature = createHash("sha256").update(token + curDate + id + path).digest("base64");
-  } catch {   // an error page, or no token: never echo it
+  } catch {
     throw new GroupwareError(`${path}: unexpected response`);
   }
   let outcome = "no response";
   try {
     const resp = await send(fetch, base + path, {
       method: "POST",
-      headers: {
-        "user-agent": UA,
-        "content-type": contentType,
-        signature,
-        "transaction-id": id,
-        authorization: "Bearer undefined",
-        timestamp: now(),
-        origin: base,
-        referer: base + "/",
-      },
+      headers: { "user-agent": UA, "content-type": contentType, signature, "transaction-id": id,
+        authorization: "Bearer undefined", timestamp: now(), origin: base, referer: base + "/" },
       body,
     });
     outcome = `HTTP ${resp.status}`;
     let data;
     try {
       data = JSON.parse(resp.text);
-    } catch {
-      throw new GroupwareError(`${path}: unexpected response`);
-    }
+    } catch {}
     if (!isObject(data)) throw new GroupwareError(`${path}: unexpected response`);
     outcome += ` resultCode=${data.resultCode}`;
     return data;
@@ -170,64 +143,50 @@ async function preLoginPost(fetch, base, path, contentType, body) {
   }
 }
 
-const loginPost = (fetch, base, entries) => preLoginPost(fetch, base, LOGIN_PATH, "application/x-www-form-urlencoded",
-  entries.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&"));
-
-/** The company code (groupSeq) the login form wants, as the login page looks it up from its host. */
-async function lookupGroupSeq(base, { fetch = globalThis.fetch } = {}) {
-  const data = await preLoginPost(fetch, base, GROUP_PATH, "application/json",
-    JSON.stringify({ host: new URL(base).host }));
-  const groupSeq = data.resultData?.groupMap?.groupSeq;
-  if (String(data.resultCode) !== "0" || typeof groupSeq !== "string" || !groupSeq) {
-    throw new GroupwareError("그룹웨어 주소에서 회사 정보를 찾지 못했습니다. 주소를 확인해 주세요.");
-  }
-  return groupSeq;
-}
-
-function checkOk(step, data) {
-  if (String(data.resultCode) !== "200") throw new LoginRejected(step, data.resultMsg);
-}
-
-// The signing token is auth_a_token and signKey is hash_key. Missing fields are null, not
-// undefined, so request bodies keep the key.
-function sessionFromInfo(base, info) {
-  const token = info?.auth_a_token, signKey = info?.hash_key;
-  if (!token || !signKey) return null;
-  const uc = info.ucUserInfo || {}, erp = info.erpUserInfo || {};
-  const email = String(uc.emailAdd || "");
-  const at = email.indexOf("@");
-  return {
-    base, token, signKey,
-    user: {
-      compSeq: uc.compSeq ?? null, groupSeq: uc.groupSeq ?? null,
-      empSeq: uc.empSeq ?? null, deptSeq: uc.deptSeq ?? null,
-      empName: uc.empName || "",
-      email,   // whole, as the web client sends it in a mail's authToken
-      emailAddr: at < 0 ? email : email.slice(0, at),
-      emailDomain: uc.emailDomain || (at < 0 ? "" : email.slice(at + 1)),
-      erpEmpCd: erp.userCode ?? null, erpCoCd: erp.companyCode ?? null,
-    },
-  };
+// The form is encoded like the web client's encodeURIComponent; raw values break passwords with &=+%#.
+async function loginPost(fetch, base, entries) {
+  const data = await preLoginPost(fetch, base, "/gw/gw050A02", "application/x-www-form-urlencoded",
+    entries.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&"));
+  if (String(data.resultCode) !== "200") throw new LoginRejected(data.resultMsg || "로그인에 실패했습니다.");
+  return data;
 }
 
 /** credentials {url, id, password} -> the session; url may be any form normalizeUrl takes. */
 export async function loginWithPassword({ url, id, password }, { fetch = globalThis.fetch } = {}) {
   const base = normalizeUrl(url);
-  const groupSeq = await lookupGroupSeq(base, { fetch });
-  checkOk("checkLoginId", await loginPost(fetch, base, [
+  // the login page's own lookup: host -> the company's groupSeq
+  const group = await preLoginPost(fetch, base, "/gw/gw050B01", "application/json", JSON.stringify({ host: new URL(base).host }));
+  const groupSeq = group.resultData?.groupMap?.groupSeq;
+  if (String(group.resultCode) !== "0" || typeof groupSeq !== "string" || !groupSeq) {
+    throw new GroupwareError("그룹웨어 주소에서 회사 정보를 찾지 못했습니다. 주소를 확인해 주세요.");
+  }
+  await loginPost(fetch, base, [
     ["loginId", Buffer.from(id).toString("base64")], ["groupSeq", groupSeq],
-    ["loginType", "checkLoginId"], ["apiTarget", "web"], ["langCode", "kr"], ["a10Domain", base]]));
+    ["loginType", "checkLoginId"], ["apiTarget", "web"], ["langCode", "kr"], ["a10Domain", base]]);
   const data = await loginPost(fetch, base, [
     ["loginId", id], ["password", password], ["groupSeq", groupSeq],
     ["scLoginYn", "N"], ["fidoPasswdLoginYn", "null"], ["langCode", "kr"],
     ["isChangeLangCodeYn", "N"], ["a10Domain", base],
     ["isPlainText", "true"], ["isMobileVerificationIgnore", "N"]]);
-  checkOk("password", data);   // LoginRejected when the groupware refuses either step
-  const session = sessionFromInfo(base, data.resultData?.sessionInfo);
-  if (!session || !session.user.compSeq || !session.user.empSeq) {
+  // the signing token is auth_a_token and signKey is hash_key
+  const info = data.resultData?.sessionInfo;
+  const uc = info?.ucUserInfo || {}, erp = info?.erpUserInfo || {};
+  if (!info?.auth_a_token || !info.hash_key || !uc.compSeq || !uc.empSeq) {
     throw new GroupwareError("로그인 응답에 세션 정보가 없습니다.");
   }
-  return session;
+  const email = uc.emailAdd || "";
+  const [emailAddr, ...domain] = email.split("@");
+  return {
+    base, token: info.auth_a_token, signKey: info.hash_key,
+    // missing fields are null, not undefined, so request bodies keep the key
+    user: {
+      compSeq: uc.compSeq, groupSeq: uc.groupSeq ?? null, empSeq: uc.empSeq, deptSeq: uc.deptSeq ?? null,
+      empName: uc.empName || "",
+      email,   // whole, as the web client sends it in a mail's authToken
+      emailAddr, emailDomain: uc.emailDomain || domain.join("@"),
+      erpEmpCd: erp.userCode ?? null, erpCoCd: erp.companyCode ?? null,
+    },
+  };
 }
 
 export const credentialsFile = (home = homedir()) => join(home, ".config", "amaranth10-mcp", "credentials.json");
@@ -253,7 +212,6 @@ function writePrivate(file, text) {
 // argv where other users' `ps` sees it, and as base64, since `-w` prints a non-ASCII one back as hex.
 const KEYCHAIN_SERVICE = "amaranth10-mcp";
 export const keychainAccount = (url, id) => `${id}@${String(url).replace(/^https:\/\//, "")}`;
-const quote = (s) => `"${s.replace(/[\\"]/g, "\\$&")}"`;
 const macKeychain = {
   load(account) {
     const r = spawnSync("/usr/bin/security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
@@ -262,8 +220,9 @@ const macKeychain = {
   },
   save(account, password) {
     const b64 = Buffer.from(password, "utf8").toString("base64");
+    const quoted = `"${account.replace(/[\\"]/g, "\\$&")}"`;
     spawnSync("/usr/bin/security", ["-i"],
-      { input: `add-generic-password -U -s ${KEYCHAIN_SERVICE} -a ${quote(account)} -w ${b64}\n`, encoding: "utf8" });
+      { input: `add-generic-password -U -s ${KEYCHAIN_SERVICE} -a ${quoted} -w ${b64}\n`, encoding: "utf8" });
     return this.load(account) === password;   // `security -i` exits 0 even when its command failed
   },
 };
@@ -274,14 +233,15 @@ export const defaultKeychain = process.platform === "darwin" ? macKeychain : nul
 export function loadCredentials({ env = process.env, home = homedir(), keychain = null } = {}) {
   let file = {};
   try {
-    file = JSON.parse(readFileSync(credentialsFile(home), "utf8")) ?? {};
-  } catch {
-    // missing or unreadable: setup writes it again
-  }
-  const fromKeychain = () => (keychain && typeof file.url === "string" && typeof file.id === "string"
-    ? keychain.load(keychainAccount(file.url, file.id)) : null);
-  const pair = env.AMARANTH_ID && env.AMARANTH_PASSWORD ? env : { AMARANTH_ID: file.id, AMARANTH_PASSWORD: file.password || fromKeychain() };
-  const creds = { url: env.AMARANTH_URL || file.url, id: pair.AMARANTH_ID, password: pair.AMARANTH_PASSWORD };
+    file = JSON.parse(readFileSync(credentialsFile(home), "utf8")) || {};
+  } catch {}   // missing or unreadable: setup writes it again
+  const envPair = env.AMARANTH_ID && env.AMARANTH_PASSWORD;
+  const creds = {
+    url: env.AMARANTH_URL || file.url,
+    id: envPair ? env.AMARANTH_ID : file.id,
+    password: envPair ? env.AMARANTH_PASSWORD
+      : file.password || (keychain && file.url && file.id ? keychain.load(keychainAccount(file.url, file.id)) : null),
+  };
   return Object.values(creds).every((v) => typeof v === "string" && v) ? creds : null;
 }
 
@@ -296,7 +256,7 @@ export function saveCredentials({ url, id, password }, { home = homedir(), keych
 
 function toGroupwareError(e) {
   if (e instanceof GroupwareError) return e;
-  if (e instanceof SessionError) return new GroupwareError(SESSION_LOST);
+  if (e instanceof SessionError) return new GroupwareError("세션이 다시 끊겼습니다. 잠시 후 다시 요청해 주세요.");
   if (e instanceof TransportError) return new GroupwareError(`그룹웨어에 연결하지 못했습니다(${e.message}).`);
   return new GroupwareError(`${e?.name}: ${e?.message}`);   // bad dates, odd response shapes
 }
@@ -310,10 +270,7 @@ export class Groupware {
   #refused = null;   // {salt, hashes: {scrypt of url + id + password: message}}, kept in rejectedFile too
 
   constructor({ fetch = globalThis.fetch, env = process.env, home = homedir(), keychain = defaultKeychain } = {}) {
-    this.#fetch = fetch;
-    this.#env = env;
-    this.#home = home;
-    this.#keychain = keychain;
+    [this.#fetch, this.#env, this.#home, this.#keychain] = [fetch, env, home, keychain];
   }
 
   /** fn(session, fetch) with a session; every failure comes out as a GroupwareError with Korean text. */
@@ -373,9 +330,7 @@ export class Groupware {
       book.hashes[hash] = e.message;
       try {
         writePrivate(rejectedFile(this.#home), JSON.stringify(book));
-      } catch {
-        // a read-only home: this process still remembers it
-      }
+      } catch {}   // a read-only home: this process still remembers it
       this.#session = null;   // so a blocked call sends nothing, not even with the stale session
       throw new CredentialsError(rejectedText(e.message));
     }
@@ -386,9 +341,7 @@ export class Groupware {
     try {
       const book = JSON.parse(readFileSync(rejectedFile(this.#home), "utf8"));
       if (typeof book?.salt === "string" && isObject(book.hashes)) return (this.#refused = book);
-    } catch {
-      // none yet, or unreadable
-    }
+    } catch {}   // none yet, or unreadable
     return (this.#refused ??= { salt: randomBytes(16).toString("hex"), hashes: {} });
   }
 }

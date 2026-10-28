@@ -9,8 +9,7 @@ import { createInterface } from "node:readline";
 import { Writable } from "node:stream";
 
 import {
-  GroupwareError, LoginRejected, credentialsFile, defaultKeychain, keychainAccount, loginWithPassword, normalizeUrl,
-  saveCredentials,
+  LoginRejected, credentialsFile, defaultKeychain, keychainAccount, loginWithPassword, normalizeUrl, saveCredentials,
 } from "./client.js";
 import { VERSION } from "./server.js";
 
@@ -20,8 +19,8 @@ const DEFAULT_SPEC = "amaranth10-mcp";
 const npxArgs = (spec) => (spec === DEFAULT_SPEC ? ["-y", `${spec}@${VERSION}`] : ["-y", "--package", spec, "amaranth10-mcp"]);
 
 // The spec npx was given (`npx -y github:owner/repo#v1 setup`), so the registration runs the same
-// package. ponytail: npx keeps it in npm's internal `_npx` field of the package.json two levels up;
-// when that is not there (a clone, a global install), --spec or the registry name stands.
+// package. ponytail: read from npm's internal `_npx` field of the package.json two levels up; without
+// it (a clone, a global install), --spec or the registry name stands.
 export function launchedSpec(url = new URL("../../../package.json", import.meta.url)) {
   try {
     const spec = JSON.parse(readFileSync(url, "utf8"))._npx?.packages?.[0];
@@ -30,7 +29,6 @@ export function launchedSpec(url = new URL("../../../package.json", import.meta.
     return null;
   }
 }
-const bareName = (spec) => spec === DEFAULT_SPEC || spec === `${DEFAULT_SPEC}@latest`;
 
 /** ask(question, {hidden}) on a terminal or a pipe; ask.close() lets the process end. */
 export function terminalPrompter(input = process.stdin, output = process.stdout) {
@@ -73,15 +71,14 @@ export async function setup({ argv = [], ask, login = loginWithPassword, home = 
   const at = argv.indexOf("--spec");
   let spec = at < 0 ? launched() ?? DEFAULT_SPEC : argv[at + 1];
   if (!spec) return fail("--spec 뒤에 패키지 이름이나 .tgz 경로를 넣어 주세요.");
-  if (bareName(spec)) spec = DEFAULT_SPEC;   // registered pinned to this version
-  if (spec !== DEFAULT_SPEC && existsSync(spec)) spec = resolve(spec);   // clients start in another directory
+  if (spec === `${DEFAULT_SPEC}@latest`) spec = DEFAULT_SPEC;   // registered pinned to this version
+  else if (spec !== DEFAULT_SPEC && existsSync(spec)) spec = resolve(spec);   // clients start in another directory
   ask ??= terminalPrompter();
   try {
     let url;
     try {
       url = normalizeUrl(await ask("그룹웨어 주소(예: https://gw.example.com): "));
     } catch (e) {
-      if (!(e instanceof GroupwareError)) throw e;
       return fail(e.message);
     }
     const id = (await ask("그룹웨어 아이디: ")).trim();

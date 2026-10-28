@@ -1,5 +1,5 @@
-// the MCP wiring: the content shape, errors as isError text, lax arguments, the bin over stdio,
-// and the write-once rule end to end
+// the MCP wiring: the content shape, errors as isError text, lax arguments, the write-once rule end
+// to end, and the bin over stdio
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -24,7 +24,7 @@ test.beforeEach((t) => t.mock.method(console, "error", () => {}));
 
 async function connect(gw) {
   const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
-  await createServer({ gw }).connect(serverSide);
+  await createServer(gw).connect(serverSide);
   const client = new Client({ name: "test", version: "0" });
   await client.connect(clientSide);
   return client;
@@ -57,7 +57,7 @@ function fakeGroupware(api) {
 
 const texts = (r) => r.content.map((c) => [c.type, c.text]);
 
-test("results reach the model the way Python's MCPServer renders them", async () => {
+test("a list is one JSON text block per item, an empty one \"[]\", anything else one block", async () => {
   const alert = (id) => ({ alertId: id, message: { alertTitle: "회의", alertContent: "내용" },
     createDate: "20261026100000", readDate: "" });
   const fake = fakeGroupware((path) => {
@@ -67,12 +67,10 @@ test("results reach the model the way Python's MCPServer renders them", async ()
   });
   const client = await connect(fake.gw);
   const row = (id) => ({ id, title: "회의", content: "내용", time: "2026-10-26 10:00", unread: true });
-  // a list is one text block per item, each 2-space JSON
   const listed = await client.callTool({ name: "alerts", arguments: {} });
   assert.deepEqual(texts(listed), [["text", JSON.stringify(row(1), null, 2)], ["text", JSON.stringify(row(2), null, 2)]]);
   assert.ok(!listed.isError);
   assert.equal(fake.calls[0].body.body.pageSize, "20", "the schema's default reaches the function");
-  // an empty list says so in one block, "[]", never no content at all; a dict is one block
   assert.deepEqual(texts(await client.callTool({ name: "mail_folders", arguments: {} })), [["text", "[]"]]);
   const balance = await client.callTool({ name: "leave_balance", arguments: {} });
   assert.equal(balance.content.length, 1);
@@ -88,7 +86,7 @@ test("a failure is isError with the Korean message only", async () => {
   assert.deepEqual([missing.isError, texts(missing)], [true, [["text", NO_CREDENTIALS]]]);
 });
 
-test("stringified arguments are parsed like the Python SDK's pre_parse_json and lax mode", async () => {
+test("numbers, flags and lists sent as JSON text are parsed; a str | int keeps its string", async () => {
   const KIM = { empSeq: "E7", empName: "김민수", deptSeq: "D2", deptName: "개발팀", compSeq: "1000", positionName: "주임" };
   const fake = fakeGroupware((path) => {
     if (path === "/mail/mail000A01") return { mailboxList: [{ name: "INBOX", mboxSeq: 2089 }] };
@@ -113,7 +111,7 @@ test("stringified arguments are parsed like the Python SDK's pre_parse_json and 
     { title: "회의", start: "2099-01-01 15:00", end: "2099-01-01 16:00", attendees: '["김민수"]' });
   assert.deepEqual(JSON.parse(preview.content[0].text).attendees, ["김민수 (개발팀)"]);
   assert.equal(fake.count("sc111A05"), 0);
-  // text that is not JSON is still refused; a str | int keeps its string
+  // text that is not JSON is still refused
   assert.equal((await client.callTool({ name: "alerts", arguments: { count: "many" } })).isError, true);
   // counts, pages and limits start at 1: a zero or negative one is refused before any request
   const sent = fake.calls.length;
@@ -132,13 +130,13 @@ const DETAIL = { schSeq: 8439, schmSeq: 8439, mcalSeq: 134, schTitle: "주간회
   startDate: "209901011500", endDate: "209901011600", alldayYn: "N", repeatType: "10", calType: "E",
   resList: [], reservedList: [], addressUserList: [], schPartEmpList: [], fileList: [], fileCnt: 0 };
 
-for (const [tool, args, write, readBack, message] of [
-  ["schedule_delete", { sch_seq: 8439, confirm: true }, "sc111A06", "sc111A03",
-    "일정 삭제 결과를 확인하지 못했습니다. 그룹웨어에서 확인해 주세요."],
-  ["schedule_create", { title: "주간회의", start: "2099-01-01 15:00", end: "2099-01-01 16:00", confirm: true },
-    "sc111A05", "sc111A04", "일정 등록 결과를 확인하지 못했습니다(sch_seq 8439). 그룹웨어에서 확인해 주세요."],
-]) {
-  test(`${tool}: a read-back refused for the session is unconfirmed, with one write`, async () => {
+test("a read-back refused for the session after a write is unconfirmed, with one write", async () => {
+  for (const [tool, args, write, readBack, message] of [
+    ["schedule_delete", { sch_seq: 8439, confirm: true }, "sc111A06", "sc111A03",
+      "일정 삭제 결과를 확인하지 못했습니다. 그룹웨어에서 확인해 주세요."],
+    ["schedule_create", { title: "주간회의", start: "2099-01-01 15:00", end: "2099-01-01 16:00", confirm: true },
+      "sc111A05", "sc111A04", "일정 등록 결과를 확인하지 못했습니다(sch_seq 8439). 그룹웨어에서 확인해 주세요."],
+  ]) {
     const fake = fakeGroupware((path, calls) => {
       const wrote = calls.some((c) => c.path.endsWith(write));
       if (wrote && path.endsWith(readBack)) return json({}, 401);   // the session went stale after the write
@@ -147,13 +145,12 @@ for (const [tool, args, write, readBack, message] of [
       if (path.endsWith("sc111A05")) return { schSeq: 8439 };
       return true;
     });
-    const client = await connect(fake.gw);
-    const out = await client.callTool({ name: tool, arguments: args });
-    assert.deepEqual([out.isError, texts(out)], [true, [["text", message]]]);
+    const out = await (await connect(fake.gw)).callTool({ name: tool, arguments: args });
+    assert.deepEqual([out.isError, texts(out)], [true, [["text", message]]], tool);
     assert.equal(fake.count(write), 1);
     assert.equal(fake.logins(), 1);
-  });
-}
+  }
+});
 
 // ---- the bin
 test("server mode writes nothing but MCP frames to stdout", async () => {
