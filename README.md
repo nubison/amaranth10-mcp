@@ -15,14 +15,14 @@
 Node.js 20 이상과 Git이 필요합니다.
 
 ```bash
-npx -y github:nubison/amaranth10-mcp#v0.10.0 setup
+npx -y github:nubison/amaranth10-mcp#semver:x setup
 ```
 
-주소·아이디·비밀번호를 입력하고 Claude Code 등록에 동의한 뒤, Claude Code를 새로 열면 됩니다. 업데이트하려면 버전 태그를 바꿔 setup을 다시 실행하세요.
+주소·아이디·비밀번호를 입력하고 Claude Code 등록에 동의한 뒤, Claude Code를 새로 열면 됩니다. `#semver:x`는 최신 릴리스를 뜻하며, Claude Code를 열 때마다 새 릴리스를 확인해 받으므로 다시 설치할 필요가 없습니다. 예전에 `#v0.8.1`처럼 버전을 지정해 설치했다면 위 명령으로 setup을 한 번 다시 실행하세요.
 
 ### Claude Desktop (macOS)
 
-[최신 릴리스](https://github.com/nubison/amaranth10-mcp/releases/latest)의 `.mcpb` 파일을 열어 설치하고 그룹웨어 접속 정보를 입력하세요. Node.js는 별도로 설치하지 않아도 됩니다.
+[최신 릴리스](https://github.com/nubison/amaranth10-mcp/releases/latest)의 `.mcpb` 파일을 열어 설치하고 그룹웨어 접속 정보를 입력하세요. Node.js는 별도로 설치하지 않아도 됩니다. 확장은 자동으로 업데이트되지 않으므로 새 릴리스가 나오면 `.mcpb`를 다시 설치하세요.
 
 서버·컨테이너는 [환경변수로 설정](docs/guide.md#환경변수로-설정)할 수 있습니다.
 

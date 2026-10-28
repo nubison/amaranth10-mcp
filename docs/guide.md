@@ -7,7 +7,8 @@
 - 그룹웨어 주소는 브라우저 주소창의 URL을 그대로 붙여 넣어도 됩니다. HTTPS 주소만 지원합니다.
 - 입력한 비밀번호는 화면에 표시되지 않으며, 로그인에 실패하면 접속 정보를 저장하지 않습니다.
 - 사용자 범위(`user`)에 등록하므로 다른 프로젝트에서도 사용할 수 있습니다.
-- 설치한 버전(`v0.10.0`)은 자동으로 업데이트되지 않습니다. 새 버전을 사용하려면 명령의 버전 태그를 바꿔 setup을 다시 실행하세요.
+- `#semver:x`는 가장 높은 버전 태그(최신 릴리스)를 뜻합니다. MCP 클라이언트가 서버를 시작할 때마다 새 릴리스를 확인해 받으며, 릴리스되지 않은 main의 변경은 받지 않습니다. 새 릴리스를 처음 받을 때는 시작이 몇 초 더 걸립니다.
+- 특정 버전에 고정하려면 `#semver:x` 대신 `#v0.10.0`처럼 버전 태그를 넣어 setup을 실행하세요.
 - setup을 마치면 Claude Desktop과 환경변수 방식에 사용할 설정도 출력됩니다.
 
 ## 환경변수로 설정
@@ -19,7 +20,7 @@
   "mcpServers": {
     "amaranth10": {
       "command": "npx",
-      "args": ["-y", "github:nubison/amaranth10-mcp#v0.10.0"],
+      "args": ["-y", "github:nubison/amaranth10-mcp#semver:x"],
       "env": {
         "AMARANTH_URL": "https://gw.example.com",
         "AMARANTH_ID": "${AMARANTH_ID}",
@@ -34,8 +35,8 @@
 
 실행 환경에는 Node.js 20 이상이 필요하며, 그룹웨어 주소와 패키지 다운로드 주소에 HTTPS로 접속할 수 있어야 합니다.
 
-- 버전 태그를 사용하는 위 예시는 Git과 `github.com`, `codeload.github.com`, `registry.npmjs.org` 접속이 필요합니다.
-- Git이 없는 환경에서는 태그 대신 해당 릴리스의 40자리 커밋 해시를 사용할 수 있습니다: `github:nubison/amaranth10-mcp#<커밋 해시>`. 이 경우 GitHub 패키지 다운로드에는 `codeload.github.com`을 사용합니다.
+- 위 예시처럼 `#semver:x`나 버전 태그를 쓰면 Git과 `github.com`, `codeload.github.com`, `registry.npmjs.org` 접속이 필요합니다.
+- Git이 없는 환경에서는 태그 대신 해당 릴리스의 40자리 커밋 해시를 사용할 수 있습니다: `github:nubison/amaranth10-mcp#<커밋 해시>`. 이 경우 GitHub 패키지 다운로드에는 `codeload.github.com`을 사용하며, 자동으로 업데이트되지 않습니다.
 - 그룹웨어 주소에 접속할 수 없으면 도구 호출 시 연결 오류를 반환합니다.
 
 ## 도구 목록
@@ -140,4 +141,4 @@ npm test
 
 테스트는 Node.js 기본 테스트 러너(`node:test`)를 사용하며, 실제 그룹웨어에는 요청하지 않습니다.
 
-릴리스하려면 `package.json`과 `manifest.json`의 버전, README와 이 가이드의 버전 표기를 함께 갱신한 뒤 `v<버전>` 태그를 push합니다. GitHub Actions가 테스트를 실행하고 해당 커밋에서 `.mcpb` 파일을 만들어 릴리스에 첨부합니다.
+릴리스하려면 `package.json`과 `manifest.json`의 버전을 갱신한 뒤 `v<버전>` 태그를 push합니다. 태그가 올라가면 `#semver:x`로 설치한 사용자는 다음 실행 때 그 버전을 받습니다. 태그 여러 개를 한꺼번에 push하면 GitHub의 최신 릴리스 표시가 낮은 버전에 붙을 수 있으니 하나씩 올리세요. GitHub Actions가 테스트를 실행하고 해당 커밋에서 `.mcpb` 파일을 만들어 릴리스에 첨부합니다.
