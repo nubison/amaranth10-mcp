@@ -245,19 +245,23 @@ const CALS = [{ mcalSeq: 134, calType: "E", displayYn: "Y", calColor: "#111" },
   { mcalSeq: 99, calType: "M", displayYn: "N" }];
 const SCH = { schSeq: 8439, schTitle: "주간회의", startDate: "202610191400", endDate: "202610191500", alldayYn: "N",
   schPlace: "대회의실", calTitle: "공용 일정", createName: "김", partName: "홍길동", contents: "안건<br>1. 예산" };
-const schFake = (rows) => fake((path) => ({ resultList: path.endsWith("sc111A02") ? CALS : rows }));
+// subscriptions: the attendance calendar (A), another (T), one not taken, one hidden
+const TAKEN = [{ tcalSeq: 3, calType: "A", takeYn: "Y", displayYn: "Y" }, { tcalSeq: 7, calType: "T", takeYn: "Y" },
+  { tcalSeq: 8, calType: "T", takeYn: "N" }, { tcalSeq: 9, calType: "A", takeYn: "Y", displayYn: "N" }];
+const schFake = (rows) => fake((path) => (path.endsWith("sc111A15") ? { takeCalList: TAKEN }
+  : { resultList: path.endsWith("sc111A02") ? CALS : rows }));
 
 test("fetchSchedule reads every shown calendar", async () => {
   const { fetch, calls, paths } = schFake([SCH]);
   const out = await fetchSchedule(RES, { start: "2026-10-19", end: "2026-10-23" }, { fetch });
-  assert.deepEqual(paths(), ["/schres/sc111A02", "/schres/sc111A03"]);
-  const body = calls[1].body;
+  assert.deepEqual(paths(), ["/schres/sc111A02", "/schres/sc111A15", "/schres/sc111A03"]);
+  const body = calls[2].body;
   assert.deepEqual([body.startDate, body.endDate, body.mySchYn, body.sortDate], ["20261019", "20261023", "N", "Y"]);
   assert.deepEqual(body.calList, [   // the hidden calendar is left out
     { mcalSeq: "134", calType: "E", adminYn: "N", color: "#111" },
     { mcalSeq: "35", calType: "M", adminYn: "Y", color: "#748FFC" }]);
   assert.deepEqual([body.tcalList, body.acalList, body.excelYn, body.abUID, body.searchEmpSeq],
-    [[], [], null, "", ""]);
+    [["7"], ["3"], null, "", ""]);
   assert.deepEqual(out, [{ sch_seq: 8439, title: "주간회의", start: "2026-10-19 14:00", end: "2026-10-19 15:00",
     all_day: false, place: "대회의실", calendar: "공용 일정", creator: "김", participants: "홍길동", memo: "안건\n1. 예산" }]);
 });
@@ -265,7 +269,7 @@ test("fetchSchedule reads every shown calendar", async () => {
 test("fetchSchedule mine_only and the memo cut", async () => {
   const { fetch, calls } = schFake([{ ...SCH, contents: "가".repeat(400) }]);
   const out = await fetchSchedule(RES, { start: "2026-10-19", end: "2026-10-19", mine_only: true }, { fetch });
-  assert.equal(calls[1].body.mySchYn, "Y");
+  assert.equal(calls[2].body.mySchYn, "Y");
   assert.equal(out[0].memo, "가".repeat(300) + " …(생략)");
 });
 

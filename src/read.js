@@ -426,12 +426,14 @@ export async function calendars(session, { fetch } = {}) {
   return rowsOf(data, "resultList", "/schres/sc111A02");
 }
 
-export async function calendarRows(session, first, last, cals, mineOnly = false, { fetch } = {}) {
+// taken: subscribed calendars (sc111A15); calType A goes in acalList, the rest in tcalList
+export async function calendarRows(session, first, last, cals, mineOnly = false, { fetch, taken = [] } = {}) {
+  const seqs = (attend) => taken.filter((c) => (c.calType === "A") === attend).map((c) => String(c.tcalSeq));
   const data = await request(session, "/schres/sc111A03",
     { companyInfo: companyInfo(session), startDate: first, endDate: last, mySchYn: mineOnly ? "Y" : "N",
       calList: cals.map((c) => ({ mcalSeq: String(c.mcalSeq), calType: c.calType ?? null,
         adminYn: c.adminYn || "N", color: c.calColor || "#748FFC" })),
-      tcalList: [], acalList: [], searchEmpSeq: "", excelYn: null, abUID: "", sortDate: "Y", langCode: "kr" },
+      tcalList: seqs(false), acalList: seqs(true), searchEmpSeq: "", excelYn: null, abUID: "", sortDate: "Y", langCode: "kr" },
     { fetch });
   return rowsOf(data, "resultList", "/schres/sc111A03");
 }
@@ -439,7 +441,11 @@ export async function calendarRows(session, first, last, cals, mineOnly = false,
 export async function fetchSchedule(session, { start, end, mine_only = false } = {}, { fetch } = {}) {
   const [first, last] = inOrder(toApiDay(start), toApiDay(end));   // bad or reversed dates fail before any request
   const shown = (await calendars(session, { fetch })).filter((c) => c.displayYn !== "N");
-  const rows = await calendarRows(session, first, last, shown, mine_only, { fetch });
+  // the attendance calendar (calType A) is a subscription filled from leave and trip requests, not in sc111A02 (live 2026-10-28)
+  const taken = rowsOf(await request(session, "/schres/sc111A15", { companyInfo: companyInfo(session),
+    deptSeq: session.user.deptSeq, empSeq: session.user.empSeq, langCode: "kr" }, { fetch }), "takeCalList", "/schres/sc111A15")
+    .filter((c) => c.takeYn === "Y" && c.displayYn !== "N");
+  const rows = await calendarRows(session, first, last, shown, mine_only, { fetch, taken });
   if (rows.length > 200) {   // every calendar over a long range would flood the model's context
     throw new GroupwareError(`일정이 ${rows.length}건이라 너무 많습니다. 기간을 줄이거나 mine_only=true로 다시 요청해 주세요.`);
   }

@@ -115,7 +115,8 @@ const TOOLS = [
     + "dept는 부서 ID(숫자)이며 부서 이름은 받지 않는다."],
   ["schedule_list", READ_ONLY, read.fetchSchedule, { start: z.string(), end: z.string(), mine_only: flag },
     "일정 목록. start/end는 'YYYY-MM-DD'(양 끝 포함). 기본은 볼 수 있는 모든 캘린더\n"
-    + "(개인·본부 일정·휴가현황 등), mine_only=true면 내가 만들었거나 참여한 일정만.\n"
+    + "(개인·본부 일정, 구독 캘린더, 근태 신청이 자동으로 올라오는 휴가·출장 캘린더 등), mine_only=true면 내가 만들었거나 참여한 일정만.\n"
+    + "휴가·출장 캘린더의 일정은 제목이 '[연차]'처럼 종류만 있고 creator가 당사자다.\n"
     + "200건이 넘으면 기간을 줄여 달라고 답한다. sch_seq는 schedule_update·schedule_delete에 쓴다."],
   ["schedule_create", WRITES, write.createSchedule,
     { title: z.string(), start: z.string(), end: z.string(), place: str(""), memo: str(""),
