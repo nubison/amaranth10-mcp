@@ -1,4 +1,4 @@
-// The MCP server: 27 tools with their names, descriptions, annotations and parameters, each one
+// The MCP server: 28 tools with their names, descriptions, annotations and parameters, each one
 // call through a shared Groupware. stdout carries MCP only.
 import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -89,7 +89,7 @@ const TOOLS = [
     "기간의 자원 예약 현황. start/end는 'YYYY-MM-DD'(하루 단위, 양 끝 포함).\n"
     + "res_seqs를 생략하면 전체 자원. status는 예약완료·승인요청·승인완료·반려 등."],
   ["resource_my_reservations", READ_ONLY, read.fetchMyReservations, { start: z.string(), end: z.string() },
-    "내 자원 예약 목록(취소된 건 제외). start/end는 'YYYY-MM-DD'.\nres_seq·start·end는 resource_cancel에 그대로 쓴다."],
+    "내 자원 예약 목록(취소된 건 제외). start/end는 'YYYY-MM-DD'.\nres_seq·start·end는 resource_update·resource_cancel에 그대로 쓴다."],
   ["resource_reserve", WRITES, write.reserveResource,
     { res_seq: strOrInt, start: z.string(), end: z.string(), title: z.string(), description: str(""),
       attendees: listOrNone(z.string()), confirm: flag },
@@ -102,6 +102,16 @@ const TOOLS = [
     "본인 자원 예약 취소. 사용자가 미리보기를 보고 명시적으로 승인한 뒤에만 confirm=true로 호출할 것.\n"
     + "confirm=false(기본)는 취소하지 않고 미리보기만 돌려준다.\n"
     + "start/end는 예약의 한국 시간 'YYYY-MM-DD HH:MM'(resource_my_reservations 참고)."],
+  ["resource_update", WRITES, write.updateReservation,
+    { res_seq: strOrInt, start: z.string(), end: z.string(), title: orNone(z.string()), new_start: orNone(z.string()),
+      new_end: orNone(z.string()), description: orNone(z.string()), confirm: flag },
+    "본인 자원 예약의 제목·시각·설명 수정. 사용자가 미리보기를 보고 명시적으로 승인한 뒤에만 confirm=true로 호출할 것.\n"
+    + "confirm=false(기본)는 바꾸지 않고 before/after 미리보기와 새 시간의 가능 여부(available)만 돌려준다.\n"
+    + "res_seq·start·end는 지금 예약의 값(resource_my_reservations 참고), 바꿀 값만 넘긴다. "
+    + "시각은 한국 시간 'YYYY-MM-DD HH:MM'.\n"
+    + "자원을 바꾸려면 resource_cancel 후 resource_reserve. 반복·종일 예약, 첨부나 일정이 연결된 예약, 끝난 예약은 수정하지 않는다. "
+    + "참석자에게 변경 알림이 갈 수 있고, 승인이 필요한 자원은 다시 승인 요청이 될 수 있다. "
+    + "결과를 확인하지 못했다는 오류가 나면 다시 호출하지 말고, 사용자에게 그룹웨어에서 확인해 달라고 할 것."],
   ["people_search", READ_ONLY, read.searchPeople, { name: z.string() },
     "이름으로 직원 찾기(2자 이상, 최대 20명): 이름·부서·직급(position)·직위(duty)."],
   ["dept_members", READ_ONLY, read.fetchDeptMembers, { dept: orNone(strOrInt) },

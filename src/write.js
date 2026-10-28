@@ -66,16 +66,24 @@ export async function reserveResource(session, { res_seq, start, end, title, des
   return { ...preview, reserved: true };
 }
 
-export async function cancelReservation(session, { res_seq, start, end, confirm = false } = {}, { fetch } = {}) {
+// my bookings of res_seq at exactly start–end, from that day's list
+async function myBookings(session, res_seq, start, end, fetch) {
   const apiStart = toApiDt(start), apiEnd = toApiDt(end);   // bad times fail before any request
   const day = String(start).slice(0, 10), me = str(session.user.empSeq);
-  const matches = async () => (await scheduleRows(session, day, day, [str(res_seq)], fetch)).filter((r) =>
+  return (await scheduleRows(session, day, day, [str(res_seq)], fetch)).filter((r) =>
     str(r.resStartDate) === apiStart && str(r.resEndDate) === apiEnd && str(r.empSeq) === me);
+}
 
-  const found = await matches();
-  if (!found.length) throw new GroupwareError("그 시간에 취소할 본인 예약을 찾지 못했습니다.");
+function onlyOne(found, what) {
+  if (!found.length) throw new GroupwareError(`그 시간에 ${what} 본인 예약을 찾지 못했습니다.`);
   if (found.length > 1) throw new GroupwareError("같은 시간에 본인 예약이 여러 건이라 하나로 정하지 못했습니다.");
-  const r = found[0];
+  return found[0];
+}
+
+export async function cancelReservation(session, { res_seq, start, end, confirm = false } = {}, { fetch } = {}) {
+  const apiStart = toApiDt(start), apiEnd = toApiDt(end);
+  const matches = () => myBookings(session, res_seq, start, end, fetch);
+  const r = onlyOne(await matches(), "취소할");
   const preview = { resource: or(r.resName, ""), title: or(r.reqText, ""), start, end };
   if (confirm !== true) return preview;
   const item = { resSeq: str(r.resSeq), seqNum: r.seqNum ?? null, resIdx: str(r.resIdx), reqText: r.reqText ?? null,
@@ -89,6 +97,90 @@ export async function cancelReservation(session, { res_seq, start, end, confirm 
   const gone = succeeded(result) && await matches().then((rows) => !rows.length, () => false);
   if (!gone) throw new GroupwareError(`취소 결과를 확인하지 못했습니다. ${CHECK}`);
   return { ...preview, cancelled: true };
+}
+
+async function reservationDetail(session, resSeq, seqNum, fetch) {
+  const d = await request(session, "/schres/rs121A10",
+    { companyInfo: companyInfo(session), resSeq: str(resSeq), seqNum, langCode: "kr" }, { fetch });
+  // without its keys and times the update would send "None" for them
+  if (!isDict(d) || !["resSeq", "seqNum", "resIdx", "startDate", "endDate", "createDate"].every((k) => py(d[k]))) {
+    throw new GroupwareError("예약 상세를 찾지 못했습니다.");
+  }
+  return d;
+}
+
+const LIVE = new Set(["RC", "RE", "CO"]);   // 예약완료, 승인요청, 승인완료
+const resView = (title, start, end) => ({ title, start, end });
+
+// updateReservation: the web client's edit form (rs121A12) for a plain one-off booking of mine;
+// the stored fields go back as they are, with these set
+export async function updateReservation(session, { res_seq, start, end, title = null, new_start = null, new_end = null,
+  description = null, confirm = false } = {}, { fetch, now = () => new Date() } = {}) {
+  if ([title, new_start, new_end, description].every((v) => v == null)) {
+    throw new GroupwareError("바꿀 값(title, new_start, new_end, description)이 없습니다.");
+  }
+  if (title != null && !title.trim()) throw new GroupwareError("예약 제목은 비울 수 없습니다.");
+  const from = new_start ?? start, to = new_end ?? end;
+  const apiFrom = toApiDt(from), apiTo = toApiDt(to);   // bad times fail before any request
+  if (apiTo <= apiFrom) throw new GroupwareError("종료 시각이 시작 시각보다 빠릅니다.");
+  if (parseLocal(end) <= now()) throw new GroupwareError("이미 끝난 예약입니다.");
+  if (new_start != null && parseLocal(new_start) < now()) throw new GroupwareError("시작 시각이 이미 지났습니다.");
+  const r = onlyOne(await myBookings(session, res_seq, start, end, fetch), "수정할");
+  const d = await reservationDetail(session, r.resSeq, r.seqNum ?? null, fetch);
+  // fail closed: only the booking just matched, mine, one-off, timed, live, with no file or linked schedule
+  for (const [broken, why] of [
+    [str(d.seqNum) !== str(r.seqNum) || str(d.startDate) !== toApiDt(start) || str(d.endDate) !== toApiDt(end),
+      "예약 상세가 목록과 다릅니다"],
+    [str(d.empSeq) !== str(session.user.empSeq), "본인 예약이 아닙니다"],
+    [str(d.repeatType) !== "10", "반복 예약입니다"],
+    [str(d.alldayYn) !== "N", "종일 예약입니다"],
+    [!LIVE.has(str(d.statusCode)), "취소·반려된 예약입니다"],
+    [!["Y", "N"].includes(str(d.apprYn)), "승인 여부를 알 수 없는 자원입니다"],
+    [py(d.schSeq) || py(d.schmSeq), "일정과 연결된 예약입니다"],
+    [py(d.fileList) || py(d.file), "첨부파일이 있는 예약입니다"],
+    [!Array.isArray(d.subscriberList) || !d.subscriberList.length, "예약자 정보가 없습니다"]]) {
+    if (broken) throw new GroupwareError(`${why}. 이 도구로는 수정하지 않습니다.`);
+  }
+  const max = num(String(d.limitReservationRange ?? "").replace(/,/g, ""));   // minutes, as the web form reads it
+  if (max > 0 && (parseLocal(to) - parseLocal(from)) / 60000 > max) {
+    throw new GroupwareError(`이 자원은 최대 ${max / 60}시간까지만 예약할 수 있습니다.`);
+  }
+  const next = [title != null ? title.trim() : or(d.reqText, ""), apiFrom, apiTo];
+  let available = true;
+  if (apiFrom !== str(d.startDate) || apiTo !== str(d.endDate)) {
+    // rs121A04 counts this booking as taken, so the overlap list (rs121A14) without it decides,
+    // and rs121A04 only says whether the resource's usage limit allows the new time
+    const limit = await request(session, "/schres/rs121A04", { companyInfo: companyInfo(session), resSeq: d.resSeq,
+      startDate: apiFrom, endDate: apiTo, alldayYn: "N", resStartDate: apiFrom.slice(0, 8) }, { fetch });
+    if (str((isDict(limit) ? limit : {}).limitYn) !== "N") throw new GroupwareError("자원 이용 제한 설정에 따라 그 시간에는 예약할 수 없습니다.");
+    const used = await request(session, "/schres/rs121A14", { companyInfo: companyInfo(session), resSeq: d.resSeq,
+      startDate: apiFrom, endDate: apiTo, alldayYn: "N", repeatType: "10", repeatEndDay: apiFrom.slice(0, 8),
+      repeatByDay: "" }, { fetch });
+    const rows = isDict(used) ? used.usedResList : null;
+    // fail closed: an unreadable answer or any other booking not cancelled or rejected is a conflict
+    available = Array.isArray(rows) && !rows.some((u) => !(str(u.seqNum) === str(d.seqNum) && str(u.resIdx) === str(d.resIdx))
+      && str(u.limitYn) !== "Y" && !["CA", "CR", "AC", "RJ"].includes(str(u.statusCode)));
+  }
+  const after = resView(next[0], from, to);
+  if (description != null) after.description = description;
+  const preview = { resource: or(d.resName, ""), before: resView(or(d.reqText, ""), start, end), after, available,
+    approval_required: d.apprYn === "Y" };
+  if (confirm !== true) return preview;
+  if (!available) throw new GroupwareError("그 시간대에는 이미 다른 예약이 있습니다.");
+  const result = await writeOnce(session, "/schres/rs121A12",
+    { companyInfo: companyInfo(session), langCode: "kr", resSeq: d.resSeq, seqNum: d.seqNum, resIdx: d.resIdx,
+      reqText: next[0], apprYn: d.apprYn, alldayYn: "N", startDatePk: d.startDate, createDatePk: d.createDate,
+      startDate: next[1], endDate: next[2], descText: description ?? or(d.descText, ""),
+      resSubscriberList: d.subscriberList.map((p) => ({ groupSeq: p.groupSeq ?? null, compSeq: p.compSeq ?? null,
+        deptSeq: p.deptSeq ?? null, empSeq: p.empSeq ?? null })),
+      uidList: "", repeatType: "10", repeatEndDay: "", repeatByDay: "", resName: d.resName ?? null },
+    "예약 수정", { fetch });
+  // the edit books anew and cancels the old one (live 2026-10-28: a new seqNum, the old one CA), so
+  // the check reads the day's list. Written already: a failed check must not read as "not changed" or repeat the write
+  const landed = succeeded(result) && await myBookings(session, d.resSeq, from, to, fetch)
+    .then((rows) => rows.filter((x) => x.reqText === next[0]).length === 1, () => false);
+  if (!landed) throw new GroupwareError(`예약 수정 결과를 확인하지 못했습니다. ${CHECK}`);
+  return { ...preview, updated: true };
 }
 
 // ---- schedules

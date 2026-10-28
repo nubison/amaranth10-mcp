@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 import { GroupwareError, SessionError } from "../src/client.js";
 import { cancelReservation, createSchedule, deleteMail, deleteSchedule, markMail, reserveResource, sendMail,
-  updateSchedule } from "../src/write.js";
+  updateReservation, updateSchedule } from "../src/write.js";
 
 const RES = { base: "https://gw.example.com", token: "G1|E1|R1", signKey: "test-sign-key",
   user: { compSeq: "1000", groupSeq: "G1", deptSeq: "D1", empSeq: "E1" } };
@@ -288,6 +288,141 @@ test("cancel: a cancel refused for the session stays a SessionError (it never ra
   await assert.rejects(cancel(api, { confirm: true }), SessionError);
   assert.equal(count(api, "rs121A11"), 1);
 });
+
+// ---- resource_update
+// an rs121A10 detail of CANCEL_ROW, with the fields the guard reads
+const RES_DETAIL = { resSeq: "12", seqNum: 11735, resIdx: "1", reqText: "테스트", resName: "대회의실 회의실",
+  startDate: "209901011400", endDate: "209901011500", createDate: "20261016103000", empSeq: "E1", apprYn: "N",
+  alldayYn: "N", repeatType: "10", statusCode: "RC", schSeq: "", schmSeq: "", fileList: [], file: [],
+  descText: "안건", limitReservationRange: "", subscriberList: [
+    { groupSeq: "G1", compSeq: "1000", deptSeq: "D1", empSeq: "E1", empName: "홍길동", loginId: "hong" },
+    { groupSeq: "G1", compSeq: "1000", deptSeq: "D2", empSeq: "E7", empName: "김민수", loginId: "kim" }] };
+const SELF = { seqNum: 11735, resIdx: "1", statusCode: "RC", limitYn: "N" };
+
+// like the live groupware, rs121A12 books anew under a new seqNum and cancels the old one: the day's
+// list then holds the new booking (unless `back` says otherwise) and the old detail is gone
+function updateApi({ detail = RES_DETAIL, used = [SELF], limitYn = "N", success = 1, write, back } = {}) {
+  return fake((path, body, calls) => {
+    const wrote = calls.find((c) => c.path.endsWith("rs121A12"))?.body;
+    if (path.endsWith("rs121A05")) {
+      if (!wrote) return { resultList: [CANCEL_ROW] };
+      return back ? back() : { resultList: [{ ...CANCEL_ROW, seqNum: 11736, reqText: wrote.reqText,
+        resStartDate: wrote.startDate, resEndDate: wrote.endDate }] };
+    }
+    if (path.endsWith("rs121A10")) {
+      return wrote ? new Response(JSON.stringify({ resultCode: 500, resultMsg: "취소/삭제된 자원예약입니다." })) : detail;
+    }
+    if (path.endsWith("rs121A04")) return { reservationYn: "Y", limitYn };   // this booking itself counts as taken
+    if (path.endsWith("rs121A14")) return { resRepeatCount: 1, usedResList: used };
+    if (path.endsWith("rs121A12")) return write ? write() : { successTf: success };
+    return {};
+  });
+}
+const resUpdate = (api, args = {}, opts = {}) => updateReservation(RES, { res_seq: "12", start: START, end: END, ...args },
+  { fetch: api.fetch, now: () => new Date(2026, 9, 28, 12, 0), ...opts });
+
+test("update: a title-only preview needs no availability check and writes nothing", async () => {
+  const api = updateApi();
+  const out = await resUpdate(api, { title: "주간회의" });
+  assert.deepEqual(out, { resource: "대회의실 회의실", before: { title: "테스트", start: START, end: END },
+    after: { title: "주간회의", start: START, end: END }, available: true, approval_required: false });
+  assert.deepEqual(api.paths(), ["/schres/rs121A05", "/schres/rs121A10"]);
+  assert.deepEqual(bodyOf(api, "rs121A10"), { companyInfo: COMPANY, resSeq: "12", seqNum: 11735, langCode: "kr" });
+});
+
+test("update: confirm sends the web form's body and reads it back", async () => {
+  const api = updateApi();
+  const out = await resUpdate(api, { new_start: "2099-01-01 14:30", new_end: "2099-01-01 16:00", confirm: true });
+  assert.equal(out.updated, true);
+  assert.deepEqual(bodyOf(api, "rs121A14"), { companyInfo: COMPANY, resSeq: "12", startDate: "209901011430",
+    endDate: "209901011600", alldayYn: "N", repeatType: "10", repeatEndDay: "20990101", repeatByDay: "" });
+  assert.deepEqual(bodyOf(api, "rs121A12"), { companyInfo: COMPANY, langCode: "kr", resSeq: "12", seqNum: 11735,
+    resIdx: "1", reqText: "테스트", apprYn: "N", alldayYn: "N", startDatePk: "209901011400",
+    createDatePk: "20261016103000", startDate: "209901011430", endDate: "209901011600", descText: "안건",
+    resSubscriberList: [{ groupSeq: "G1", compSeq: "1000", deptSeq: "D1", empSeq: "E1" },
+      { groupSeq: "G1", compSeq: "1000", deptSeq: "D2", empSeq: "E7" }],
+    uidList: "", repeatType: "10", repeatEndDay: "", repeatByDay: "", resName: "대회의실 회의실" });
+  assert.equal(count(api, "rs121A12"), 1);
+});
+
+for (const [id, used, available] of [
+  ["only-itself", [SELF], true],
+  ["cancelled-other", [SELF, { ...SELF, seqNum: 2, statusCode: "CA" }], true],
+  ["limit-row", [{ ...SELF, seqNum: 2, limitYn: "Y" }], true],
+  ["other-booking", [SELF, { ...SELF, seqNum: 2 }], false],
+  ["same-seq-other-idx", [{ ...SELF, resIdx: "2" }], false],
+  ["unknown-status", [{ ...SELF, seqNum: 2, statusCode: "ZZ" }], false],
+  ["unreadable", null, false]]) {
+  test(`update: another booking in the new time blocks the write: ${id}`, async () => {
+    const api = updateApi({ used });
+    const args = { new_start: "2099-01-01 15:00", new_end: "2099-01-01 16:00" };
+    assert.equal((await resUpdate(api, args)).available, available);
+    if (!available) await assert.rejects(resUpdate(api, { ...args, confirm: true }), rejectsWith(/이미 다른 예약이 있습니다/));
+    assert.equal(count(api, "rs121A12"), 0);
+  });
+}
+
+for (const [id, detail, match] of [
+  ["someone-elses", { empSeq: "E9" }, /본인 예약이 아닙니다/],
+  ["repeating", { repeatType: "20" }, /반복 예약입니다/],
+  ["all-day", { alldayYn: "Y" }, /종일 예약입니다/],
+  ["rejected", { statusCode: "RJ" }, /취소·반려된 예약입니다/],
+  ["no-approval-flag", { apprYn: undefined }, /승인 여부/],
+  ["linked-schedule", { schSeq: "88" }, /일정과 연결된 예약입니다/],
+  ["file", { fileList: [{ fileSn: 1 }] }, /첨부파일이 있는 예약입니다/],
+  ["no-subscribers", { subscriberList: [] }, /예약자 정보가 없습니다/],
+  ["other-booking", { seqNum: 9 }, /목록과 다릅니다/],
+  ["no-create-date", { createDate: "" }, /예약 상세를 찾지 못했습니다/]]) {
+  test(`update refuses what the guard cannot vouch for: ${id}`, async () => {
+    const api = updateApi({ detail: { ...RES_DETAIL, ...detail } });
+    await assert.rejects(resUpdate(api, { title: "새 제목", confirm: true }), rejectsWith(match));
+    assert.equal(count(api, "rs121A12"), 0);
+  });
+}
+
+for (const [id, args, opts, match] of [
+  ["nothing-to-change", {}, {}, /바꿀 값/],
+  ["blank-title", { title: "  " }, {}, /비울 수 없습니다/],
+  ["end-first", { new_end: "2099-01-01 13:00" }, {}, /종료 시각이 시작 시각보다 빠릅니다/],
+  ["ended", { title: "x" }, { now: () => new Date(2099, 0, 1, 15, 0) }, /이미 끝난 예약입니다/],
+  ["past-start", { new_start: "2099-01-01 13:00" }, { now: () => new Date(2099, 0, 1, 14, 30) }, /이미 지났습니다/]]) {
+  test(`update rejects a bad change before the network: ${id}`, async () => {
+    const api = updateApi();
+    await assert.rejects(resUpdate(api, args, opts), rejectsWith(match));
+    assert.deepEqual(api.calls, []);
+  });
+}
+
+test("update: an ongoing booking may still be extended", async () => {
+  const api = updateApi();
+  const out = await resUpdate(api, { new_end: "2099-01-01 15:30", confirm: true }, { now: () => new Date(2099, 0, 1, 14, 30) });
+  assert.equal(out.updated, true);
+});
+
+test("update: the usage limit and the longest booking are enforced", async () => {
+  await assert.rejects(resUpdate(updateApi({ limitYn: "Y" }), { new_end: "2099-01-01 16:00" }), rejectsWith(/이용 제한/));
+  const long = updateApi({ detail: { ...RES_DETAIL, limitReservationRange: "60" } });
+  await assert.rejects(resUpdate(long, { new_end: "2099-01-01 16:00" }), rejectsWith(/최대 1시간/));
+  assert.equal(count(long, "rs121A04"), 0);
+});
+
+for (const [id, opts] of [["no-success-flag", { success: 0 }], ["write-timeout", { write: timesOut }],
+  ["check-timeout", { back: timesOut }], ["unchanged", { back: () => ({ resultList: [CANCEL_ROW] }) }]]) {
+  test(`update: an unclear write or check is unconfirmed, never retried: ${id}`, async () => {
+    const api = updateApi(opts);
+    await assert.rejects(resUpdate(api, { title: "새 제목", confirm: true }),
+      rejectsWith(/^예약 수정 결과를 확인하지 못했습니다\. 그룹웨어에서 확인해 주세요\.$/));
+    assert.equal(count(api, "rs121A12"), 1);
+  });
+}
+
+for (const confirm of NOT_TRUE) {
+  test(`update: confirm ${JSON.stringify(confirm)} only previews`, async () => {
+    const api = updateApi();
+    assert.equal((await resUpdate(api, { title: "새 제목", confirm })).updated, undefined);
+    assert.equal(count(api, "rs121A12"), 0);
+  });
+}
 
 // ---- schedule_create / schedule_update / schedule_delete
 const WRITE_CALS = [
