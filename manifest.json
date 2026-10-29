@@ -2,7 +2,7 @@
   "manifest_version": "0.4",
   "name": "amaranth10-mcp",
   "display_name": "Amaranth10",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "더존 아마란스10 그룹웨어의 메일·게시판·알림·일정·전자결재·조직도·연차·휴가를 조회하고, 메일 보내기·삭제·안 읽음 표시, 자원 예약·수정·취소, 개인 일정 등록·수정·삭제와 연차 신청·취소를 한다",
   "author": {
     "name": "nubison",

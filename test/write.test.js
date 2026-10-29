@@ -65,11 +65,11 @@ test.beforeEach((t) => t.mock.method(console, "error", () => {}));
 // ---- resource_reserve
 const START = "2099-01-01 14:00", END = "2099-01-01 15:00";
 
-function resApi({ reservationYn = "N", resSeq = "7", apprYn = "N", write = () => ({ successTf: 1 }) } = {}) {
+function resApi({ reservationYn = "N", limitYn = "N", resSeq = "7", apprYn = "N", write = () => ({ successTf: 1 }) } = {}) {
   return fake((path, body) => {
     if (path.endsWith("gw102A04")) return searchIn(body);
     if (path.endsWith("rs121A01")) return { resultList: [{ resSeq, resName: "회의실 A", apprYn }] };
-    if (path.endsWith("rs121A04")) return { reservationYn };
+    if (path.endsWith("rs121A04")) return { reservationYn, limitYn };
     if (path.endsWith("rs121A05")) return { resultList: [{ ...ROW, resSeq, reqText: "회의" }] };
     return path.endsWith("rs121A06") ? write() : {};
   });
@@ -105,7 +105,12 @@ test("reserve: refusals write nothing", () => refuses(resApi, reserve, [
   [{ attendees: ["박없음"] }, {}, /찾지 못했습니다/],
   [{}, { reservationYn: "Y" }, /이미 예약이 있습니다/],
   [{}, { reservationYn: null }, /이미 예약이 있습니다/],   // only an explicit "N" is free
+  [{}, { limitYn: "Y" }, /이용 제한/],
+  [{}, { limitYn: null }, /이용 제한/],
 ]));
+
+test("reserve: a time over the resource's usage limit is refused at the preview", () =>
+  assert.rejects(reserve(resApi({ limitYn: "Y" })), /이용 제한/));
 
 test("reserve: success is 1, \"1\" or true; anything else is unconfirmed, sent once", async () => {
   for (const successTf of [1, "1", true]) {

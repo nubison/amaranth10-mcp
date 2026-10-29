@@ -9,6 +9,7 @@ import { calendarRows, calendars, companyInfo, erp, fetchLeaveBalance, fetchMail
   ymdOf } from "./read.js";
 
 const CHECK = "그룹웨어에서 확인해 주세요.";
+const LIMITED = "자원 이용 제한 설정에 따라 그 시간에는 예약할 수 없습니다.";
 const unsure = (what, where = "") => new GroupwareError(`${what} 결과를 확인하지 못했습니다${where}. ${CHECK}`);
 const filled = (v) => (v && typeof v === "object" ? Object.keys(v).length > 0 : Boolean(v));   // [] and {} are empty
 const label = (p) => `${p.empName} (${p.deptName})`;
@@ -46,7 +47,10 @@ export async function reserveResource(session, { res_seq, start, end, title, des
   const apiStart = toApiDt(start), apiEnd = toApiDt(end), resSeq = res.res_seq;   // the API's own id, not the caller's spelling
   const check = await request(session, "/schres/rs121A04", { companyInfo: companyInfo(session), resSeq, startDate: apiStart,
     endDate: apiEnd, alldayYn: "N", resStartDate: apiStart.slice(0, 8) }, { fetch });
-  const available = check?.reservationYn === "N";   // fail closed: a missing or renamed field must not unlock the write
+  // fail closed: a missing or renamed field must not unlock the write. limitYn is the resource's usage limit (the
+  // web form stops on it too), which the write would only refuse
+  if (check?.limitYn !== "N") throw new GroupwareError(LIMITED);
+  const available = check?.reservationYn === "N";
   const preview = { resource: res.name, start, end, available, approval_required: res.approval_required,
     attendees: people.map(label) };
   if (confirm !== true) return preview;
@@ -139,7 +143,7 @@ export async function updateReservation(session, { res_seq, start, end, title = 
     // and rs121A04 only says whether the resource's usage limit allows the new time
     const span = { companyInfo: companyInfo(session), resSeq: d.resSeq, startDate: apiFrom, endDate: apiTo, alldayYn: "N" };
     const limit = await request(session, "/schres/rs121A04", { ...span, resStartDate: apiFrom.slice(0, 8) }, { fetch });
-    if (limit?.limitYn !== "N") throw new GroupwareError("자원 이용 제한 설정에 따라 그 시간에는 예약할 수 없습니다.");
+    if (limit?.limitYn !== "N") throw new GroupwareError(LIMITED);
     const rows = (await request(session, "/schres/rs121A14",
       { ...span, repeatType: "10", repeatEndDay: apiFrom.slice(0, 8), repeatByDay: "" }, { fetch }))?.usedResList;
     // fail closed: an unreadable answer or any other booking not cancelled or rejected is a conflict
