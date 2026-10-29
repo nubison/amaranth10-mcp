@@ -17,6 +17,10 @@ const org = (p, groupSeq = p.groupSeq) => ({ groupSeq: groupSeq ?? null, compSeq
 // the flag may arrive as 1, "1" or true; 0, "0", false and a missing flag are not a success
 const succeeded = (result) => ["1", "true"].includes(String(result?.successTf).toLowerCase());
 const whyOf = (e) => (e instanceof SessionError ? "세션 끊김" : e?.message || String(e?.name));   // transport text is header-free
+// the groupware's own popup pages, as its web client opens them (windowOpen; both opened live 2026-10-29)
+const popup = (session, params) => `${session.base}/#/popup?${new URLSearchParams(params)}`;
+const bookingLink = (session, r) => popup(session, { MicroModuleCode: "schres", callComp: "UKAP002", seqNum: r.seqNum,
+  resSeq: r.resSeq });
 
 // One write call. A SessionError means the gateway refused it before it ran, so the caller's one
 // re-login sends the first write, not a second; anything else unclear may have landed and must
@@ -55,7 +59,10 @@ export async function reserveResource(session, { res_seq, start, end, title, des
     resSubscriberList: [me,...people.filter((p) => String(p.empSeq) !== String(me.empSeq)).map((p) => org(p, me.groupSeq))],
     uidList: "", repeatType: "10", repeatEndDay: "" }, "예약", { fetch });
   if (!succeeded(result)) throw unsure("예약");
-  return { ...preview, reserved: true };
+  // booked already: a failed read-back only drops the link
+  const [row] = await myBookings(session, resSeq, start, end, fetch).then((rows) => rows.filter((r) => r.reqText === title),
+    () => []);
+  return { ...preview, reserved: true, link: row ? bookingLink(session, row) : null };
 }
 
 // my bookings of res_seq at exactly start–end, from that day's list
@@ -154,10 +161,10 @@ export async function updateReservation(session, { res_seq, start, end, title = 
     "예약 수정", { fetch });
   // the edit books anew and cancels the old one (live 2026-10-28: a new seqNum, the old one CA), so
   // the check reads the day's list. Written already: a failed check must not read as "not changed" or repeat the write
-  const landed = succeeded(result) && await myBookings(session, d.resSeq, from, to, fetch)
-    .then((rows) => rows.filter((x) => x.reqText === newTitle).length === 1, () => false);
-  if (!landed) throw unsure("예약 수정");
-  return { ...preview, updated: true };
+  const [row, ...more] = succeeded(result) ? await myBookings(session, d.resSeq, from, to, fetch)
+    .then((rows) => rows.filter((x) => x.reqText === newTitle), () => []) : [];
+  if (!row || more.length) throw unsure("예약 수정");
+  return { ...preview, updated: true, link: bookingLink(session, row) };
 }
 
 // ---- schedules
@@ -673,7 +680,9 @@ async function submitLeave(session, plan, { fetch, now }) {
   if (!/^\d+$/.test(sent?.result)) throw unsent("문서 번호 없음");
   // submitted already: a failed read-back must not repeat anything
   const row = (await leaveRows(session, plan.first, plan.last, { fetch }).catch(() => [])).find((r) => sameApp(r, app.appDt, app.appSq));
-  return { ...plan.preview, submitted: true, id, doc_id: String(sent.result), status: row ? leaveStatus(row) : "" };
+  return { ...plan.preview, submitted: true, id, doc_id: String(sent.result), status: row ? leaveStatus(row) : "",
+    link: popup(session, { MicroModuleCode: "eap", callComp: "UBAP002", docID: sent.result, formId: plan.form.formId,
+      docAuth: "0" }) };
 }
 
 // a document still with its writer: the writer's, 결재진행, and no one else on the line has acted. approval_read

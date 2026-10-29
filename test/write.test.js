@@ -70,6 +70,7 @@ function resApi({ reservationYn = "N", resSeq = "7", apprYn = "N", write = () =>
     if (path.endsWith("gw102A04")) return searchIn(body);
     if (path.endsWith("rs121A01")) return { resultList: [{ resSeq, resName: "회의실 A", apprYn }] };
     if (path.endsWith("rs121A04")) return { reservationYn };
+    if (path.endsWith("rs121A05")) return { resultList: [{ ...ROW, resSeq, reqText: "회의" }] };
     return path.endsWith("rs121A06") ? write() : {};
   });
 }
@@ -83,7 +84,8 @@ test("reserve: a preview checks the slot; confirm books me, then each attendee o
     attendees: ["홍길동 (개발팀)", "김민수 (개발팀)"] };
   assert.deepEqual(await reserve(api, args), preview);
   assert.deepEqual(writes(api), []);
-  assert.deepEqual(await reserve(api, { ...args, confirm: true }), { ...preview, reserved: true });
+  assert.deepEqual(await reserve(api, { ...args, confirm: true }), { ...preview, reserved: true,
+    link: "https://gw.example.com/#/popup?MicroModuleCode=schres&callComp=UKAP002&seqNum=11735&resSeq=7" });
   assert.deepEqual(bodyOf(api, "rs121A04"), { companyInfo: COMPANY, resSeq: 7, startDate: "209901011400",
     endDate: "209901011500", alldayYn: "N", resStartDate: "20990101" });
   // the search result has no groupSeq: the booker's own fills it
@@ -206,6 +208,7 @@ test("resource update: confirm sends the web form's body and reads it back", asy
   const api = updateApi();
   const out = await resUpdate(api, { new_start: "2099-01-01 14:30", new_end: "2099-01-01 16:00", confirm: true });
   assert.equal(out.updated, true);
+  assert.equal(out.link, "https://gw.example.com/#/popup?MicroModuleCode=schres&callComp=UKAP002&seqNum=11736&resSeq=12");
   assert.deepEqual(bodyOf(api, "rs121A14"), { companyInfo: COMPANY, resSeq: "12", startDate: "209901011430",
     endDate: "209901011600", alldayYn: "N", repeatType: "10", repeatEndDay: "20990101", repeatByDay: "" });
   assert.deepEqual(bodyOf(api, "rs121A12"), { companyInfo: COMPANY, langCode: "kr", resSeq: "12", seqNum: 11735,
@@ -654,7 +657,7 @@ test("leave request: what it cannot ask for stops before any write", () => {
 test("leave request: confirm saves, links and submits once each, in order", async () => {
   const api = leaveApi();
   assert.deepEqual(await leave(api, { confirm: true }), { ...PREVIEW, submitted: true, id: "20261028-501", doc_id: "1004400",
-    status: "결재진행" });
+    status: "결재진행", link: "https://gw.example.com/#/popup?MicroModuleCode=eap&callComp=UBAP002&docID=1004400&formId=2036&docAuth=0" });
   assert.deepEqual(writes(api), SUBMIT);
   const created = bodyOf(api, "create");
   assert.deepEqual([created.appEmpCd, created.titleDc, created.applicationList], ["123", PREVIEW.title,

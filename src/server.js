@@ -35,6 +35,7 @@ const orNone = (t) => t.nullable().default(null);
 const listOrNone = (t) => lax(orNone(z.array(t)));
 
 const APPROVE = "사용자가 미리보기를 보고 명시적으로 승인한 뒤에만 confirm=true로 호출할 것.";
+const LINK = "성공하면 link(그룹웨어에서 바로 여는 주소)를 돌려주니 사용자에게 그대로 보여 줄 것.";
 const UNCLEAR = "결과를 확인하지 못했다는 오류가 나면 다시 호출하지 말고, 사용자에게 그룹웨어에서 확인해 달라고 할 것.";
 
 const TOOLS = [
@@ -94,7 +95,8 @@ const TOOLS = [
       attendees: listOrNone(z.string()), confirm: flag },
     `자원 예약. ${APPROVE}\n`
     + "confirm=false(기본)는 예약하지 않고 미리보기만 돌려준다.\n"
-    + "start/end는 한국 시간 'YYYY-MM-DD HH:MM'.\nattendees는 참석자 이름 목록(동명이인은 '이름 부서'). 참석자에게 알림이 갈 수 있다."],
+    + "start/end는 한국 시간 'YYYY-MM-DD HH:MM'.\nattendees는 참석자 이름 목록(동명이인은 '이름 부서'). 참석자에게 알림이 갈 수 있다. "
+    + LINK],
   ["resource_cancel", WRITES, write.cancelReservation,
     { res_seq: strOrInt, start: z.string(), end: z.string(), confirm: flag },
     `본인 자원 예약 취소. ${APPROVE}\n`
@@ -107,7 +109,7 @@ const TOOLS = [
     + "confirm=false(기본)는 바꾸지 않고 before/after 미리보기와 새 시간의 가능 여부(available)만 돌려준다.\n"
     + "res_seq·start·end는 지금 예약의 값(resource_my_reservations 참고), 바꿀 값만 넘긴다. 시각은 한국 시간 'YYYY-MM-DD HH:MM'.\n"
     + "자원을 바꾸려면 resource_cancel 후 resource_reserve. 반복·종일 예약, 첨부나 일정이 연결된 예약, 끝난 예약은 수정하지 않는다. "
-    + "참석자에게 변경 알림이 갈 수 있고, 승인이 필요한 자원은 다시 승인 요청이 될 수 있다. " + UNCLEAR],
+    + "참석자에게 변경 알림이 갈 수 있고, 승인이 필요한 자원은 다시 승인 요청이 될 수 있다. " + LINK + " " + UNCLEAR],
   ["people_search", READ_ONLY, read.searchPeople, { name: z.string() },
     "이름으로 직원 찾기(2자 이상, 최대 20명): 이름·부서·직급(position)·직위(duty)."],
   ["dept_members", READ_ONLY, read.fetchDeptMembers, { dept: orNone(strOrInt) },
@@ -159,7 +161,7 @@ const TOOLS = [
     + "(아는 값만 넘기면 폼에 채워지고, confirm은 쓰지 않는다). 폼이 없으면 confirm=false(기본)로 미리보기(시각·차감 일수·"
     + "남는 연차·제목·결재라인)를 받아 사용자에게 보여 주고, 확인받은 뒤에만 confirm=true로 다시 부른다.\n"
     + "상신하면 결재자에게 알림이 간다. 실패해도 다시 시도하지 않는다. 그룹웨어에 신청 수정이 없어서, 바꾸려면 "
-    + "leave_cancel로 취소한 뒤 다시 신청한다."],
+    + "leave_cancel로 취소한 뒤 다시 신청한다. " + LINK],
   ["leave_cancel", WRITES, write.cancelLeave, { id: orNone(z.string()), confirm: flag },
     "결재가 끝나지 않은 연차·반차 신청을 취소. 결재진행 중이고 아무도 처리하지 않았으면 회수한 뒤 삭제하고, 임시보관이면 "
     + "삭제하고, 상신대기(결재 문서 없음)면 신청을 지운다. 되돌릴 수 없다. 결재가 끝난 신청은 그룹웨어에서 결재취소해야 한다.\n"
