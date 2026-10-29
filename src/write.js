@@ -53,8 +53,9 @@ export async function reserveResource(session, { res_seq, start, end, title, des
   const available = check?.reservationYn === "N";
   const preview = { resource: res.name, start, end, available, approval_required: res.approval_required,
     attendees: people.map(label) };
+  if (!available) preview.conflicts = await holders(session, resSeq, start, end, fetch);
   if (confirm !== true) return preview;
-  if (!available) throw new GroupwareError("그 시간대에는 이미 예약이 있습니다.");
+  if (!available) throw new GroupwareError(`그 시간대에는 이미 예약이 있습니다${held(preview.conflicts)}.`);
   const me = org(session.user);
   const result = await writeOnce(session, "/schres/rs121A06", { companyInfo: companyInfo(session), langCode: "kr", resSeq,
     reqText: title, apprYn: res.approval_required ? "Y" : "N", alldayYn: "N", startDate: apiStart, endDate: apiEnd,
@@ -68,6 +69,18 @@ export async function reserveResource(session, { res_seq, start, end, title, des
     () => []);
   return { ...preview, reserved: true, link: row ? bookingLink(session, row) : null };
 }
+
+// who holds res_seq within start–end, from the days' lists (the duplicate checks name no one); a cancelled or
+// rejected booking holds nothing, and an unreadable list only leaves the names out
+async function holders(session, res_seq, start, end, fetch, skip = null) {
+  const from = toApiDt(start), to = toApiDt(end);
+  const rows = await scheduleRows(session, start.slice(0, 10), end.slice(0, 10), [String(res_seq)], fetch).catch(() => []);
+  return rows.filter((r) => String(r.resStartDate) < to && String(r.resEndDate) > from && String(r.seqNum) !== String(skip)
+    && !["CA", "CR", "AC", "RJ"].includes(r.statusCode))
+    .map((r) => ({ booker: r.empName || "", start: fmtStamp(r.resStartDate), end: fmtStamp(r.resEndDate) }))
+    .sort((a, b) => a.start.localeCompare(b.start));
+}
+const held = (list) => (list.length ? `(${list.map((h) => `${h.booker} ${h.start}~${h.end}`).join(", ")})` : "");
 
 // my bookings of res_seq at exactly start–end, from that day's list
 async function myBookings(session, res_seq, start, end, fetch) {
@@ -154,8 +167,9 @@ export async function updateReservation(session, { res_seq, start, end, title = 
   if (description != null) after.description = description;
   const preview = { resource: d.resName || "", before: { title: d.reqText || "", start, end }, after, available,
     approval_required: d.apprYn === "Y" };
+  if (!available) preview.conflicts = await holders(session, d.resSeq, from, to, fetch, d.seqNum);
   if (confirm !== true) return preview;
-  if (!available) throw new GroupwareError("그 시간대에는 이미 다른 예약이 있습니다.");
+  if (!available) throw new GroupwareError(`그 시간대에는 이미 다른 예약이 있습니다${held(preview.conflicts)}.`);
   const result = await writeOnce(session, "/schres/rs121A12",
     { companyInfo: companyInfo(session), langCode: "kr", resSeq: d.resSeq, seqNum: d.seqNum, resIdx: d.resIdx,
       reqText: newTitle, apprYn: d.apprYn, alldayYn: "N", startDatePk: d.startDate, createDatePk: d.createDate,

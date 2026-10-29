@@ -65,12 +65,12 @@ test.beforeEach((t) => t.mock.method(console, "error", () => {}));
 // ---- resource_reserve
 const START = "2099-01-01 14:00", END = "2099-01-01 15:00";
 
-function resApi({ reservationYn = "N", limitYn = "N", resSeq = "7", apprYn = "N", write = () => ({ successTf: 1 }) } = {}) {
+function resApi({ reservationYn = "N", limitYn = "N", resSeq = "7", day = null, apprYn = "N", write = () => ({ successTf: 1 }) } = {}) {
   return fake((path, body) => {
     if (path.endsWith("gw102A04")) return searchIn(body);
     if (path.endsWith("rs121A01")) return { resultList: [{ resSeq, resName: "회의실 A", apprYn }] };
     if (path.endsWith("rs121A04")) return { reservationYn, limitYn };
-    if (path.endsWith("rs121A05")) return { resultList: [{ ...ROW, resSeq, reqText: "회의" }] };
+    if (path.endsWith("rs121A05")) return { resultList: day ?? [{ ...ROW, resSeq, reqText: "회의" }] };
     return path.endsWith("rs121A06") ? write() : {};
   });
 }
@@ -108,6 +108,18 @@ test("reserve: refusals write nothing", () => refuses(resApi, reserve, [
   [{}, { limitYn: "Y" }, /이용 제한/],
   [{}, { limitYn: null }, /이용 제한/],
 ]));
+
+test("reserve: a taken slot names who holds it, in the preview and the refusal", async () => {
+  const day = [{ ...ROW, empName: "김민수", resStartDate: "209901011330", resEndDate: "209901011430" },
+    { ...ROW, empName: "박영희", resStartDate: "209901011500", resEndDate: "209901011600" },   // right after it
+    { ...ROW, empName: "최영수", resStartDate: "209901011300", resEndDate: "209901011400" },   // right before it
+    { ...ROW, empName: "이철수", statusCode: "CA" }];
+  const api = resApi({ reservationYn: "Y", day });
+  assert.deepEqual((await reserve(api)).conflicts, [{ booker: "김민수", start: "2099-01-01 13:30", end: "2099-01-01 14:30" }]);
+  await assert.rejects(reserve(api, { confirm: true }),
+    rejectsWith(/^그 시간대에는 이미 예약이 있습니다\(김민수 2099-01-01 13:30~2099-01-01 14:30\)\.$/));
+  assert.deepEqual(writes(api), []);
+});
 
 test("reserve: a time over the resource's usage limit is refused at the preview", () =>
   assert.rejects(reserve(resApi({ limitYn: "Y" })), /이용 제한/));
@@ -183,11 +195,11 @@ const SELF = { seqNum: 11735, resIdx: "1", statusCode: "RC", limitYn: "N" };
 
 // like the live groupware, rs121A12 books anew under a new seqNum: the day's list then holds the new
 // booking, unless back() answers
-function updateApi({ detail = {}, used = [SELF], limitYn = "N", write = () => ({ successTf: 1 }), back } = {}) {
+function updateApi({ detail = {}, used = [SELF], day = [ROW], limitYn = "N", write = () => ({ successTf: 1 }), back } = {}) {
   return fake((path, _body, calls) => {
     const wrote = calls.find((c) => c.path.endsWith("rs121A12"))?.body;
     if (path.endsWith("rs121A05")) {
-      if (!wrote) return { resultList: [ROW] };
+      if (!wrote) return { resultList: day };
       return back ? back() : { resultList: [{ ...ROW, seqNum: 11736, reqText: wrote.reqText,
         resStartDate: wrote.startDate, resEndDate: wrote.endDate }] };
     }
@@ -239,6 +251,16 @@ test("resource update: another booking in the new time blocks the write", async 
     if (!available) await assert.rejects(resUpdate(api, { ...args, confirm: true }), rejectsWith(/이미 다른 예약이 있습니다/));
     assert.deepEqual(writes(api), []);
   }
+});
+
+test("resource update: a taken new time names who holds it, never this booking", async () => {
+  const other = { ...ROW, seqNum: 2, empSeq: "E7", empName: "김민수", resStartDate: "209901011500", resEndDate: "209901011600" };
+  const api = updateApi({ used: [SELF, { ...SELF, seqNum: 2 }], day: [ROW, other] });
+  const args = { new_start: "2099-01-01 14:30", new_end: "2099-01-01 16:00" };
+  assert.deepEqual((await resUpdate(api, args)).conflicts, [{ booker: "김민수", start: "2099-01-01 15:00", end: "2099-01-01 16:00" }]);
+  await assert.rejects(resUpdate(api, { ...args, confirm: true }),
+    rejectsWith(/이미 다른 예약이 있습니다\(김민수 2099-01-01 15:00~2099-01-01 16:00\)\.$/));
+  assert.deepEqual(writes(api), []);
 });
 
 test("resource update: refusals write nothing", () => refuses(updateApi, resUpdate, [
