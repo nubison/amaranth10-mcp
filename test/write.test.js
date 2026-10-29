@@ -576,8 +576,11 @@ const LINE = [
   { user_nm: "홍길동", act_nm: "결재", doc_line_m_seq: 1, doc_line_s_seq: 1, act_id: "A1", co_id: "1000", dept_id: "D1", user_id: "E1", doc_line_gb: "1" },
   { user_nm: "김팀장", act_nm: "결재", doc_line_m_seq: 2, doc_line_s_seq: 1, act_id: "A1", co_id: "1000", dept_id: "D1", user_id: "E9", doc_line_gb: "1" }];
 const SUBMIT = ["create", "GetLinkKey", "SetEnageGroup", "saveLinkKey", "eap110A06"];
+// saved approval lines: "나만" holds the writer alone and is never offered
+const SAVED = [{ appLineId: 233, appLineNm: "[개인]휴가" }, { appLineId: 300, appLineNm: "나만" }];
 
-function leaveApi({ spans = [span("20261216")], fail = {} } = {}) {
+// drafted: the line the document's own draft comes back with
+function leaveApi({ spans = [span("20261216")], lines = SAVED, drafted = LINE, fail = {} } = {}) {
   return fake((path, body) => {
     const name = path.split("/").pop();
     if (fail[name]) return fail[name](body);
@@ -592,11 +595,14 @@ function leaveApi({ spans = [span("20261216")], fail = {} } = {}) {
       case "eap096A45": return [{ formDTp: "HP_HPD0110_00012", formId: 2037 },
         { formDTp: "HP_HPD0110_00011", formId: 2036, formNm: "연차휴가신청서" }];
       case "getAnnualLeaveInfoOfEmployee": return { unusedCnt: 10 };
+      case "eap096A48": return lines;
       case "create": return { appSq: 501, coCd: "1000", appDt: "20261028" };
       case "GetLinkKey": return { linkKey: "LINK-1" };
       case "saveLinkKey": return 1;
       case "eap110A03": return { mainhtml: MAIN, ucUserInfo: { compName: "회사", deptName: "개발팀", empName: "홍길동",
-        oauth_token: "TOKEN-SECRET" }, resultMap: { hidAppDocLine: LINE, hidRefer: [{ div: "d", org_id: "D20" }],
+        oauth_token: "TOKEN-SECRET" }, resultMap: {
+        hidAppDocLine: body.approkey ? drafted : body.appLineId === "300" ? [LINE[0]] : LINE,
+        hidRefer: [{ div: "d", org_id: "D20", dept_nm: "인사팀" }],
         outProcessForm: { outBindData: BIND }, docnumtype: [{ cd_val: "1001" }], getFormData: [{ form_id: 2036 }] } };
       case "eap110A06": return { result: 1004400 };
       // the same appSq under another application date is a different application
@@ -605,14 +611,15 @@ function leaveApi({ spans = [span("20261216")], fail = {} } = {}) {
     }
   });
 }
-const ask = (api, args = {}) => requestLeave(S, { kind: "연차", start: "2026-12-16", reason: "가족 여행", ...args },
-  { fetch: api.fetch, now: () => new Date(2026, 9, 28, 9, 30, 5) });
+const NOW = () => new Date(2026, 9, 28, 9, 30, 5);
+const leave = (api, args = {}, ask = null) => requestLeave(S, { kind: "연차", start: "2026-12-16", reason: "가족 여행",
+  approval_line: "[개인]휴가", ...args }, { fetch: api.fetch, now: NOW, ask });
 const PREVIEW = { kind: "연차", start: "2026-12-16", end: "2026-12-16", time: "09:00~18:00", days: 1, remaining_after: 9,
-  title: "[개발팀 홍길동] 12-16 연차신청서", reason: "가족 여행", approval: "그룹웨어 기본 결재선으로 상신하며, 결재자에게 알림이 갑니다." };
+  title: "[개발팀 홍길동] 12-16 연차신청서", reason: "가족 여행", approval_line: "[개인]휴가: 홍길동(결재) → 김팀장(결재), 참조 인사팀" };
 
 test("leave request: a preview reads only and keeps the employee's private fields in", async () => {
   const api = leaveApi();
-  assert.deepEqual(await ask(api), PREVIEW);
+  assert.deepEqual(await leave(api), PREVIEW);
   assert.deepEqual(writes(api), []);
   const item = bodyOf(api, "validateNew").newItem;
   assert.deepEqual([item.atCd, item.startDt, item.endDt, item.startTm, item.endTm, item.atDt, item.ycUseCnt],
@@ -622,17 +629,17 @@ test("leave request: a preview reads only and keeps the employee's private field
 
 test("leave request: 반반차 is two hours from start_time", async () => {
   const api = leaveApi();
-  assert.equal((await ask(api, { kind: "반반차", start_time: "16:00" })).time, "16:00~18:00");
+  assert.equal((await leave(api, { kind: "반반차", start_time: "16:00" })).time, "16:00~18:00");
   const calc = bodyOf(api, "calculateApplicationDays");
   assert.deepEqual([calc.startTime, calc.endTime], ["1600", "1800"]);
   for (const start_time of [null, "4pm", "16:75", "23:00"]) {
-    await assert.rejects(ask(leaveApi(), { kind: "반반차", start_time }), rejectsWith(/start_time/));
+    await assert.rejects(leave(leaveApi(), { kind: "반반차", start_time }), rejectsWith(/start_time/));
   }
 });
 
 test("leave request: what it cannot ask for stops before any write", () => {
   const validate = (resultCode, resultMsg) => ({ fail: { validateNew: () => new Response(JSON.stringify({ resultCode, resultMsg })) } });
-  return refuses(leaveApi, ask, [
+  return refuses(leaveApi, leave, [
     [{ kind: "기타휴가" }, {}, /kind는 연차·반반차 중 하나/],
     [{ start: "2026-12-22", end: "2026-12-18" }, {}, /시작일\(2026-12-22\)이 종료일/],
     [{}, { spans: [] }, /근무일이 없습니다/],
@@ -646,8 +653,8 @@ test("leave request: what it cannot ask for stops before any write", () => {
 
 test("leave request: confirm saves, links and submits once each, in order", async () => {
   const api = leaveApi();
-  assert.deepEqual(await ask(api, { confirm: true }), { ...PREVIEW, submitted: true, id: "20261028-501", doc_id: "1004400",
-    status: "결재진행", approval_line: ["홍길동(결재)", "김팀장(결재)"] });
+  assert.deepEqual(await leave(api, { confirm: true }), { ...PREVIEW, submitted: true, id: "20261028-501", doc_id: "1004400",
+    status: "결재진행" });
   assert.deepEqual(writes(api), SUBMIT);
   const created = bodyOf(api, "create");
   assert.deepEqual([created.appEmpCd, created.titleDc, created.applicationList], ["123", PREVIEW.title,
@@ -663,35 +670,97 @@ test("leave request: confirm saves, links and submits once each, in order", asyn
     + "<p>2026년 홍길동 연차 &lt;가족 여행&gt;</p></body>");
   assert.deepEqual(p.modifyDocInfo.appdocLineList.map((l) => [l.doc_line_m_seq, l.user_id]), [[1, "E1"], [2, "E9"]]);
   assert.deepEqual(p.modifyDocInfo.appdocReceiveList, [{ receive_div: "10", org_div: "d", org_id: "D20" }]);
+  assert.deepEqual(api.calls.filter((c) => c.path.endsWith("eap110A03")).map((c) => [c.body.approkey.slice(0, 4), c.body.appLineId]),
+    [["", "233"], ["", "300"], ["ERP_", "233"]]);   // each saved line read, then the chosen one drafted
   assert.ok(!/SECRET/.test(JSON.stringify(api.calls)));
 });
 
 test("leave request: a failure before the submit discards the saved application", async () => {
   const api = leaveApi({ fail: { GetLinkKey: timesOut } });
-  await assert.rejects(ask(api, { confirm: true }), rejectsWith(/^결재 문서를 만들지 못해.*저장한 근태신청을 지웠습니다/));
+  await assert.rejects(leave(api, { confirm: true }), rejectsWith(/^결재 문서를 만들지 못해.*저장한 근태신청을 지웠습니다/));
   assert.deepEqual(writes(api), ["create", "GetLinkKey", "deleteSubmittedApplicationList"]);
   assert.deepEqual(bodyOf(api, "deleteSubmittedApplicationList"), [{ coCd: "1000", appDt: "20261028", appSq: 501 }]);
   const stuck = leaveApi({ fail: { saveLinkKey: () => 0, deleteSubmittedApplicationList: timesOut } });
-  await assert.rejects(ask(stuck, { confirm: true }), rejectsWith(/id 20261028-501.*잇지 못했습니다.*상신대기로 남았으니 leave_cancel/));
+  await assert.rejects(leave(stuck, { confirm: true }), rejectsWith(/id 20261028-501.*잇지 못했습니다.*상신대기로 남았으니 leave_cancel/));
   assert.ok(!writes(stuck).includes("eap110A06"));
 });
 
 test("leave request: a session lost after the save is not run again and leaves the application", async () => {
   const api = leaveApi({ fail: { SetEnageGroup: unauthorized } });
-  const e = await ask(api, { confirm: true }).catch((x) => x);
+  const e = await leave(api, { confirm: true }).catch((x) => x);
   assert.ok(e instanceof GroupwareError && !(e instanceof SessionError));   // a SessionError would re-run the tool
   assert.match(e.message, /id 20261028-501.*세션 끊김/);
   assert.deepEqual(writes(api), ["create", "GetLinkKey", "SetEnageGroup"]);
   // the save itself may be refused by an expired session: that one is safe to run again
-  await assert.rejects(ask(leaveApi({ fail: { create: unauthorized } }), { confirm: true }), SessionError);
+  await assert.rejects(leave(leaveApi({ fail: { create: unauthorized } }), { confirm: true }), SessionError);
 });
 
 test("leave request: an unclear submit says to check and never discards", async () => {
   for (const fail of [timesOut, unauthorized, () => ({ result: null })]) {
     const api = leaveApi({ fail: { eap110A06: fail } });
-    await assert.rejects(ask(api, { confirm: true }), rejectsWith(/id 20261028-501.*상신 결과를 확인하지 못했습니다.*leave_cancel로/));
+    await assert.rejects(leave(api, { confirm: true }), rejectsWith(/id 20261028-501.*상신 결과를 확인하지 못했습니다.*leave_cancel로/));
     assert.deepEqual(writes(api), SUBMIT);
   }
+});
+
+test("leave request: only a saved line with someone besides the writer, and the submit must draft that same line", async () => {
+  const pickOne = /approval_line은 저장된 결재라인 '\[개인\]휴가' 중 하나로/;
+  await refuses(leaveApi, leave, [[{ approval_line: null }, {}, pickOne], [{ approval_line: "나만" }, {}, pickOne],
+    [{}, { lines: [SAVED[1]] }, /본인 외 결재자가 있는 저장된 결재라인이 없습니다/]]);
+  assert.equal((await leave(leaveApi(), { approval_line: "233" })).approval_line, PREVIEW.approval_line);
+  // the document's draft came back with someone else on it: nothing is submitted and the application goes
+  const api = leaveApi({ drafted: [LINE[0], { ...LINE[1], user_id: "E8" }] });
+  await assert.rejects(leave(api, { confirm: true }), rejectsWith(/^결재 문서를 만들지 못해\(결재 문서의 결재선·참조가 미리보기와 다릅니다\.\)/));
+  assert.deepEqual(writes(api), ["create", "GetLinkKey", "SetEnageGroup", "saveLinkKey", "deleteSubmittedApplicationList"]);
+});
+
+// a client's form: answers in turn, each an accept with that content or "decline"
+function formOf(...answers) {
+  const asked = [];
+  const ask = async (params) => {
+    asked.push(params);
+    const a = answers.shift();
+    return a === "decline" ? { action: "decline" } : { action: "accept", content: a };
+  };
+  return { ask, asked };
+}
+const FILLED = { kind: "연차", start: "2026-12-16", reason: "가족 여행", approval_line: "233" };
+
+test("leave request with a form: an unchanged accept submits what the form showed, a change plans and asks again", async () => {
+  const api = leaveApi(), form = formOf(FILLED);
+  assert.equal((await leave(api, {}, form.ask)).submitted, true);
+  const [{ message, requestedSchema: schema }] = form.asked;
+  assert.match(message, /^연차 2026-12-16 09:00~18:00\n연차 1일 사용, 신청 후 남는 연차 9일\n제목: .*\n사유: 가족 여행\n결재라인: \[개인\]휴가: 홍길동\(결재\) → 김팀장\(결재\), 참조 인사팀\n\n값을 바꾸지 않고 승인하면 바로 상신/);
+  assert.deepEqual(schema.required, ["kind", "start", "approval_line"]);
+  assert.deepEqual([schema.properties.kind.enum, schema.properties.kind.default, schema.properties.start.default],
+    [["연차", "반반차"], "연차", "2026-12-16"]);
+  assert.deepEqual(schema.properties.approval_line, { type: "string", title: "결재라인", default: "233",
+    oneOf: [{ const: "233", title: "[개인]휴가: 홍길동(결재) → 김팀장(결재), 참조 인사팀" }] });
+  assert.deepEqual(writes(api), SUBMIT);
+
+  // nothing given: the only line is filled in, the rest asked for; the answer is planned and shown before it goes
+  const empty = leaveApi(), twice = formOf(FILLED, FILLED);
+  assert.equal((await requestLeave(S, {}, { fetch: empty.fetch, now: NOW, ask: twice.ask })).submitted, true);
+  assert.deepEqual(twice.asked.map((a) => a.message.split("\n")[0]), ["휴가 신청 내용을 입력해 주세요.", "연차 2026-12-16 09:00~18:00"]);
+  assert.equal(twice.asked[0].requestedSchema.properties.approval_line.default, "233");
+  assert.equal(twice.asked[0].requestedSchema.properties.kind.default, undefined);
+  assert.deepEqual(writes(empty), SUBMIT);
+
+  // shown, then changed: the change is planned and shown again, and only that goes
+  const changed = leaveApi(), edit = { ...FILLED, reason: "병원" }, again = formOf(edit, edit);
+  await leave(changed, {}, again.ask);
+  assert.deepEqual(again.asked.map((a) => /사유: (.*)/.exec(a.message)[1]), ["가족 여행", "병원"]);
+  assert.equal(bodyOf(changed, "create").applicationList[0].appRmkDc, "병원");
+});
+
+test("leave request with a form: a declined form submits nothing, and confirm=true does not skip the form", async () => {
+  for (const args of [{}, { confirm: true }]) {
+    const api = leaveApi(), form = formOf("decline");
+    assert.deepEqual(await leave(api, args, form.ask), { submitted: false, note: "폼에서 승인받지 못해 신청하지 않았습니다." });
+    assert.equal(form.asked.length, 1);
+    assert.deepEqual(writes(api), []);
+  }
+  await assert.rejects(leave(leaveApi({ lines: [SAVED[1]] }), {}, formOf().ask), rejectsWith(/본인 외 결재자가 있는/));
 });
 
 test("fillBody fills every field and stops at one without a value", () => {
@@ -796,11 +865,39 @@ test("leave cancel: once withdrawn, a failed delete says where the document is a
   assert.match(e.message, /회수해 임시보관으로 옮겼지만.*세션 끊김/);
 });
 
+test("leave cancel with a form: the person picks among what can still be canceled, and the pick cancels it", async () => {
+  const row = { ...LEAVE_ROW, startDt: "20261216", endDt: "20261216", appRmkDc: "가족 여행" };
+  const rows = [row, { ...row, atDt: "20261217" }, { ...row, appSq: "502", approState: "1" }, { ...row, appSq: "503", linkAtCd: "1030" },
+    { ...row, appSq: "504", reportCancYn: "Y" }, { ...row, appSq: "505", approState: "2", startDt: "20261218", endDt: "20261219", appRmkDc: "" }];
+  const viaForm = (api, args, form) => cancelLeave(S, args, { fetch: api.fetch, now: () => new Date(2026, 9, 29), ask: form.ask });
+  const api = withdrawApi({ rows }), form = formOf({ id: "20261028-501" });
+  assert.equal((await viaForm(api, {}, form)).canceled, true);
+  assert.deepEqual([bodyOf(api, "at00001").startDate, bodyOf(api, "at00001").endDate], ["20260101", "20271231"]);
+  const [{ message, requestedSchema }] = form.asked;
+  assert.match(message, /^취소할 연차 신청을 고르세요\. 승인하면 바로 취소되며 되돌릴 수 없습니다/);
+  assert.deepEqual(requestedSchema.properties.id, { type: "string", title: "신청", oneOf: [
+    { const: "20261028-501", title: "2026-12-16 연차 (결재진행) 가족 여행" },
+    { const: "20261028-505", title: "2026-12-18~2026-12-19 연차 (상신대기)" }] });
+  assert.deepEqual(writes(api), ["eap110A20", "eap107A25"]);
+
+  const declined = withdrawApi({ rows }), no = formOf("decline");
+  assert.deepEqual(await viaForm(declined, { id: "20261028-501", confirm: true }, no), { canceled: false, note: "폼에서 승인받지 못해 취소하지 않았습니다." });
+  assert.equal(no.asked[0].requestedSchema.properties.id.default, "20261028-501");
+  assert.deepEqual(writes(declined), []);
+
+  // nothing cancelable: no form; an id that cannot be canceled says why, before any form
+  const none = formOf();
+  assert.match((await viaForm(withdrawApi({ rows: [rows[2]] }), {}, none)).note, /취소할 수 있는 연차 신청이 없습니다/);
+  await assert.rejects(viaForm(withdrawApi({ row: { ...row, approState: "1" } }), { id: "20261028-501" }, none),
+    rejectsWith(/결재가 끝난 신청은/));
+  assert.equal(none.asked.length, 0);
+});
+
 // ---- every tool
 test("every write tool only previews unless confirm is exactly true", async () => {
   const tools = [[resApi, reserve], [cancelApi, cancel], [updateApi, (api, a) => resUpdate(api, { title: "새 제목", ...a })],
     [schApi, create], [schApi, (api, a) => update(api, { title: "t", ...a })], [schApi, remove], [mailApi, sendTo],
-    [mailApi, delMail], [leaveApi, ask], [withdrawApi, cancelOf]];
+    [mailApi, delMail], [leaveApi, leave], [withdrawApi, cancelOf]];
   for (const confirm of [undefined, false, "true", 1, "yes"]) {
     for (const [makeApi, call] of tools) {
       const api = makeApi();

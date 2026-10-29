@@ -423,14 +423,54 @@ const sameApp = (r, appDt, appSq) => String(r.appDt) === String(appDt) && String
 const REFUSED = { 22028: "그 기간에 이미 신청한 근태가 있습니다.",
   22023: "남은 연차가 부족하거나 마이너스 연차를 쓸 수 없습니다." };
 
+async function leaveCodes(session, fetch) {
+  const base = await request(session, "/human/common/attendapplication/getApplicationBaseInfo", {}, { fetch });
+  const codes = (base?.attendCodeList || []).filter((c) => c.linkAtCd === LEAVE && c.useYn !== "N" && c.outProcessId);
+  if (!codes.length) throw new GroupwareError(`연차 신청 항목을 받지 못했습니다. ${CHECK}`);
+  return { base, codes };
+}
+
+async function leaveForm(session, code, fetch) {
+  const u = session.user, formDTp = code.outProcessId;
+  const forms = await request(session, "/eap/eap096A45", { header: { groupSeq: u.groupSeq, empSeq: u.empSeq },
+    body: { companyInfo: { compSeq: u.compSeq, bizSeq: u.compSeq, deptSeq: u.deptSeq }, formDTp, langCode: "kr" } }, { fetch });
+  const form = Array.isArray(forms) ? forms.filter((f) => f.formDTp === formDTp) : [];
+  if (form.length !== 1) throw new GroupwareError(`결재 양식(${formDTp})을 찾지 못했습니다. ${CHECK}`);
+  return form[0];
+}
+
+const draft = (session, formId, approkey, appLineId, fetch) => request(session, "/eap/eap110A03", { docID: 0, formID: formId,
+  approkey, draftTp: "", reDraft: "", docType: "", doc_auth: 0, pageCode: "UBAP001", appLineId }, { fetch });
+const who = (l) => `${l.user_nm || ""}(${l.act_nm || ""})`;
+// who approves, in order, and who gets a copy: what the person agrees to and what the submit must still have
+function lineOf(rm) {
+  const line = Array.isArray(rm?.hidAppDocLine) ? rm.hidAppDocLine : [], refer = Array.isArray(rm?.hidRefer) ? rm.hidRefer : [];
+  return { line, refer, sig: JSON.stringify([line.map((l) => String(l.user_id)), refer.map((r) => String(r.org_id))]),
+    text: line.map(who).join(" → ") + (refer.length ? `, 참조 ${refer.map((r) => r.user_nm || r.dept_nm || "").join("·")}` : "") };
+}
+const NO_LINES = "본인 외 결재자가 있는 저장된 결재라인이 없습니다. 그룹웨어 전자결재에서 결재라인을 먼저 저장해 주세요.";
+
+// The person's saved approval lines for the form, each as the draft loader fills it in without a document key
+// (a read). With no saved line the draft holds the writer alone (live 2026-10-29), which would approve the
+// leave by itself: such a line is never offered.
+async function approvalLines(session, form, fetch) {
+  const saved = await request(session, "/eap/eap096A48", { formId: form.formId }, { fetch });
+  const me = String(session.user.empSeq), out = [];
+  for (const s of Array.isArray(saved) ? saved : []) {
+    const l = lineOf((await draft(session, form.formId, "", String(s.appLineId), fetch))?.resultMap);
+    if (l.line.some((x) => String(x.user_id) !== me)) out.push({ id: String(s.appLineId), name: String(s.appLineNm || s.appLineId), ...l });
+  }
+  return out;
+}
+
 // Everything the request needs, read only: the code, the work-day window, the days it takes, the server's
-// own checks, the title and the form
-async function planLeave(session, { kind, start, end, reason, start_time }, { fetch, now }) {
+// own checks, the title, the form and the approval line
+async function planLeave(session, { kind, start, end = null, reason = "", start_time = null, approval_line = null },
+  { fetch, now }) {
   const [coCd, empCd] = erp(session);
   const first = toApiDay(start), last = end ? toApiDay(end) : first;
   if (first > last) throw new GroupwareError(`시작일(${fmtDate(first)})이 종료일(${fmtDate(last)})보다 늦습니다.`);
-  const base = await request(session, "/human/common/attendapplication/getApplicationBaseInfo", {}, { fetch });
-  const codes = (base?.attendCodeList || []).filter((c) => c.linkAtCd === LEAVE && c.useYn !== "N" && c.outProcessId);
+  const { base, codes } = await leaveCodes(session, fetch);
   const code = codes.find((c) => c.atNm === String(kind ?? "").trim());
   if (!code) throw new GroupwareError(`kind는 ${codes.map((c) => c.atNm).join("·")} 중 하나로 넣어 주세요.`);
   const window = await request(session, "/human/common/attendapplication/getStartTmEndTmByWorkType",
@@ -474,15 +514,17 @@ async function planLeave(session, { kind, start, end, reason, start_time }, { fe
   const title = await request(session, "/human/attendapplication/0hr00011", { applicationList: items, employeeList: [employee] },
     { fetch });
   if (typeof title !== "string" || !title) throw new GroupwareError(`신청서 제목을 받지 못했습니다. ${CHECK}`);
-  const u = session.user, formDTp = code.outProcessId;
-  const forms = await request(session, "/eap/eap096A45", { header: { groupSeq: u.groupSeq, empSeq: u.empSeq },
-    body: { companyInfo: { compSeq: u.compSeq, bizSeq: u.compSeq, deptSeq: u.deptSeq }, formDTp, langCode: "kr" } }, { fetch });
-  const form = Array.isArray(forms) ? forms.filter((f) => f.formDTp === formDTp) : [];
-  if (form.length !== 1) throw new GroupwareError(`결재 양식(${formDTp})을 찾지 못했습니다. ${CHECK}`);
+  const form = await leaveForm(session, code, fetch);
+  const lines = await approvalLines(session, form, fetch), pick = String(approval_line ?? "").trim();
+  const line = lines.find((l) => l.id === pick || l.name === pick);
+  if (!line) {
+    throw new GroupwareError(lines.length ? `approval_line은 저장된 결재라인 ${lines.map((l) => `'${l.name}'`).join("·")} 중 하나로 `
+      + "넣어 주세요. 사용자에게 고르게 할 것." : NO_LINES);
+  }
   const days = num(calc.ycUseCnt), { remaining } = await fetchLeaveBalance(session, {}, { fetch, now });
-  return { code, employee, items, title, form: form[0], first, last, preview: { kind: code.atNm, start: fmtDate(first),
+  return { code, employee, items, title, form, line, first, last, preview: { kind: code.atNm, start: fmtDate(first),
     end: fmtDate(last), time: time.replace(/(\d\d)(\d\d)/g, "$1:$2"), days, remaining_after: remaining - days, title, reason,
-    approval: "그룹웨어 기본 결재선으로 상신하며, 결재자에게 알림이 갑니다." } };
+    approval_line: `${line.name}: ${line.text}` } };
 }
 
 // The web editor swaps each <input mapping_key> of the form for its bound value and wraps head and body
@@ -499,7 +541,7 @@ export function fillBody(mainhtml, bindText) {
 
 // Link the saved application to a new e-approval document and load its draft. Nothing here makes a
 // document yet, so a failure leaves only the application.
-async function linkDraft(session, { code, form, title }, { coCd, appDt, appSq }, fetch) {
+async function linkDraft(session, { code, form, title, line: chosen }, { coCd, appDt, appSq }, fetch) {
   const approKey = `ERP_${randomUUID()}`, api = "/human/attendapplication/interlock";
   const linkKey = (await request(session, "/system/apiUtilEap/GetLinkKey", { menuCode: "HPD0110", approKey, vPCoCd: coCd, coCd },
     { fetch }))?.linkKey;
@@ -510,15 +552,15 @@ async function linkDraft(session, { code, form, title }, { coCd, appDt, appSq },
   if (num(await request(session, "/human/openapi/attendapplication/saveLinkKey", { linkKey, appSq, coCd, appDt }, { fetch })) !== 1) {
     throw new GroupwareError("근태신청과 결재 문서를 잇지 못했습니다.");
   }
-  const draft = await request(session, "/eap/eap110A03", { docID: 0, formID: form.formId, approkey: approKey, draftTp: "",
-    reDraft: "", docType: "", doc_auth: 0, pageCode: "UBAP001", appLineId: "" }, { fetch });
-  const rm = draft?.resultMap || {}, line = rm.hidAppDocLine, bind = rm.outProcessForm?.outBindData;
-  if (!Array.isArray(line) || !line.length || typeof bind !== "string" || !rm.docnumtype?.[0]?.cd_val || !draft.mainhtml) {
+  const d = await draft(session, form.formId, approKey, chosen.id, fetch);
+  const rm = d?.resultMap || {}, { line, refer, sig } = lineOf(rm), bind = rm.outProcessForm?.outBindData;
+  if (!line.length || typeof bind !== "string" || !rm.docnumtype?.[0]?.cd_val || !d.mainhtml) {
     throw new GroupwareError("결재 문서 초안을 받지 못했습니다.");
   }
   if (String(rm.getFormData?.[0]?.form_id) !== String(form.formId)) throw new GroupwareError("결재 초안의 양식이 다릅니다.");
-  return { approKey, info: draft.ucUserInfo || {}, line, refer: Array.isArray(rm.hidRefer) ? rm.hidRefer : [], bind,
-    numbering: rm.docnumtype[0].cd_val, body: fillBody(draft.mainhtml, bind) };
+  if (sig !== chosen.sig) throw new GroupwareError("결재 문서의 결재선·참조가 미리보기와 다릅니다.");
+  return { approKey, info: d.ucUserInfo || {}, line, refer, bind, numbering: rm.docnumtype[0].cd_val,
+    body: fillBody(d.mainhtml, bind) };
 }
 
 // A saved application that has no document yet (상신대기): the employee screens have no delete for it, this
@@ -526,10 +568,62 @@ async function linkDraft(session, { code, form, title }, { coCd, appDt, appSq },
 const discardLeave = (session, { coCd, appDt, appSq }, fetch) => writeOnce(session,
   "/human/attendapplication/deleteSubmittedApplicationList", [{ coCd, appDt, appSq }], "근태신청 삭제", { fetch });
 
-export async function requestLeave(session, { kind, start, end = null, reason = "", start_time = null, confirm = false } = {},
-  { fetch, now = () => new Date() } = {}) {
-  const plan = await planLeave(session, { kind, start, end, reason, start_time }, { fetch, now });
-  if (confirm !== true) return plan.preview;
+// ask: a client that can show a form; then the form, not confirm, decides
+export async function requestLeave(session, args = {}, { fetch, now = () => new Date(), ask = null } = {}) {
+  if (ask) return askLeave(session, args, { fetch, now, ask });
+  const plan = await planLeave(session, args, { fetch, now });
+  return args.confirm === true ? submitLeave(session, plan, { fetch, now }) : plan.preview;
+}
+
+const FIELDS = ["kind", "start", "end", "start_time", "reason", "approval_line"];
+const valuesOf = (o) => Object.fromEntries(FIELDS.map((k) => [k, String(o?.[k] ?? "").trim()]));
+const isDay = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s);
+const span = (start, end) => (end !== start ? `${start}~${end}` : start);
+
+function leaveSchema(codes, lines, v) {
+  const kinds = codes.map((c) => c.atNm), dflt = (ok, x) => (ok && x ? { default: x } : {});
+  return { type: "object", required: ["kind", "start", "approval_line"], properties: {
+    kind: { type: "string", title: "종류", enum: kinds, ...dflt(kinds.includes(v.kind), v.kind) },
+    start: { type: "string", title: "시작일", format: "date", ...dflt(isDay(v.start), v.start) },
+    end: { type: "string", title: "종료일", description: "하루면 비워 두세요", format: "date", ...dflt(isDay(v.end), v.end) },
+    start_time: { type: "string", title: "반반차 시작 시각", description: "반반차만, HH:MM부터 2시간", ...dflt(true, v.start_time) },
+    reason: { type: "string", title: "사유", ...dflt(true, v.reason) },
+    approval_line: { type: "string", title: "결재라인", oneOf: lines.map((l) => ({ const: l.id, title: `${l.name}: ${l.text}` })),
+      ...dflt(lines.some((l) => l.id === v.approval_line), v.approval_line) } } };
+}
+
+const leaveText = (p) => [`${p.kind} ${span(p.start, p.end)} ${p.time}`,
+  `연차 ${p.days}일 사용, 신청 후 남는 연차 ${p.remaining_after}일`, `제목: ${p.title}`, `사유: ${p.reason || "(없음)"}`,
+  `결재라인: ${p.approval_line}`].join("\n");
+
+// The person fills in or corrects every field and sees the plan for exactly those values: an accept with
+// nothing changed submits, a change plans again and asks again.
+async function askLeave(session, args, { fetch, now, ask }) {
+  const { codes } = await leaveCodes(session, fetch);
+  const lines = await approvalLines(session, await leaveForm(session, codes[0], fetch), fetch);
+  if (!lines.length) throw new GroupwareError(NO_LINES);
+  let v = valuesOf(args);
+  v.approval_line = lines.find((l) => l.id === v.approval_line || l.name === v.approval_line)?.id
+    ?? (lines.length === 1 && !v.approval_line ? lines[0].id : v.approval_line);
+  for (;;) {
+    let plan = null, message;
+    try {
+      plan = await planLeave(session, v, { fetch, now });
+      message = `${leaveText(plan.preview)}\n\n값을 바꾸지 않고 승인하면 바로 상신되고 결재자에게 알림이 갑니다. `
+        + "값을 바꾸면 다시 계산해 보여 드립니다.";
+    } catch (e) {
+      if (e instanceof SessionError) throw e;
+      message = v.kind && v.start ? `휴가 신청 내용을 확인해 주세요.\n${e.message}` : "휴가 신청 내용을 입력해 주세요.";
+    }
+    const r = await ask({ message, requestedSchema: leaveSchema(codes, lines, v) });
+    if (r?.action !== "accept") return { submitted: false, note: "폼에서 승인받지 못해 신청하지 않았습니다." };
+    const next = valuesOf(r.content);
+    if (plan && JSON.stringify(next) === JSON.stringify(v)) return submitLeave(session, plan, { fetch, now });
+    v = next;
+  }
+}
+
+async function submitLeave(session, plan, { fetch, now }) {
   const [coCd, empCd] = erp(session);
   const saved = await writeOnce(session, "/human/attendapplication/create", { coCd: "", appDt: "", appEmpCd: empCd,
     deptCd: "", titleDc: plan.title, approLineId: "", calLinkKey: "", linkKey: "", approState: "", fileGroup: 0,
@@ -579,8 +673,7 @@ export async function requestLeave(session, { kind, start, end = null, reason = 
   if (!/^\d+$/.test(sent?.result)) throw unsent("문서 번호 없음");
   // submitted already: a failed read-back must not repeat anything
   const row = (await leaveRows(session, plan.first, plan.last, { fetch }).catch(() => [])).find((r) => sameApp(r, app.appDt, app.appSq));
-  return { ...plan.preview, submitted: true, id, doc_id: String(sent.result), status: row ? leaveStatus(row) : "",
-    approval_line: d.line.map((l) => `${l.user_nm || ""}(${l.act_nm || ""})`) };
+  return { ...plan.preview, submitted: true, id, doc_id: String(sent.result), status: row ? leaveStatus(row) : "" };
 }
 
 // a document still with its writer: the writer's, 결재진행, and no one else on the line has acted. approval_read
@@ -620,7 +713,34 @@ async function deleteDoc(session, docId, fetch) {
 
 const CANCEL = { 0: "결재 전 문서를 회수한 뒤 삭제합니다.", 5: "임시보관 문서를 삭제합니다.", 2: "결재 문서 없이 저장만 된 신청을 지웁니다." };
 
-export async function cancelLeave(session, { id, confirm = false } = {}, { fetch } = {}) {
+const cancelable = (r) => r.linkAtCd === LEAVE && Object.hasOwn(CANCEL, String(r.approState)) && r.reportCancYn !== "Y"
+  && String(r.cancellationApplication) !== "true";
+// ask: a client that can show a form; the person picks one of the requests still cancelable and the pick
+// cancels it, confirm aside
+export async function cancelLeave(session, { id = null, confirm = false } = {}, { fetch, now = () => new Date(), ask = null } = {}) {
+  if (!ask) return cancelOne(session, id, confirm === true, fetch);
+  const year = now().getFullYear(), options = new Map(), given = String(id ?? "").trim();
+  for (const r of (await leaveRows(session, `${year}0101`, `${year + 1}1231`, { fetch })).filter(cancelable)) {
+    const key = `${r.appDt}-${r.appSq}`;   // one application, however many stretches
+    if (!options.has(key)) {
+      options.set(key, `${span(fmtDate(r.startDt), fmtDate(r.endDt))} ${r.atItemNm || r.atCdNm || r.atNm || ""} (${leaveStatus(r)})`
+        + (r.appRmkDc ? ` ${r.appRmkDc}` : ""));
+    }
+  }
+  if (given && !options.has(given)) {   // outside these years, or not cancelable: the checks say which
+    const p = await cancelOne(session, given, false, fetch);
+    options.set(given, `${span(p.start, p.end)} ${p.kind} (${p.status})`);
+  }
+  if (!options.size) return { canceled: false, note: "결재 전이라 취소할 수 있는 연차 신청이 없습니다. 결재가 끝난 신청은 그룹웨어 근태신청에서 결재취소해 주세요." };
+  const r = await ask({ message: "취소할 연차 신청을 고르세요. 승인하면 바로 취소되며 되돌릴 수 없습니다. "
+    + "결재 진행 중인 문서는 회수한 뒤 삭제합니다.", requestedSchema: { type: "object", required: ["id"], properties: {
+    id: { type: "string", title: "신청", oneOf: [...options].map(([k, title]) => ({ const: k, title })),
+      ...(options.has(given) ? { default: given } : {}) } } } });
+  if (r?.action !== "accept") return { canceled: false, note: "폼에서 승인받지 못해 취소하지 않았습니다." };
+  return cancelOne(session, r.content?.id, true, fetch);
+}
+
+async function cancelOne(session, id, confirm, fetch) {
   const [coCd, empCd] = erp(session);
   const m = /^(\d{8})-(\d+)$/.exec(String(id ?? "").trim());
   if (!m) throw new GroupwareError("id에는 leave_requests의 id('YYYYMMDD-번호')를 넣어 주세요.");

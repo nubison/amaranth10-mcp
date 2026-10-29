@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 
 import { Groupware } from "../src/client.js";
 import { createServer } from "../src/server.js";
@@ -22,10 +23,12 @@ const tmpHome = () => mkdtempSync(join(tmpdir(), "a10-home-"));
 
 test.beforeEach((t) => t.mock.method(console, "error", () => {}));
 
-async function connect(gw) {
+// answer: a client that can show forms, answering each with it
+async function connect(gw, answer = null) {
   const [serverSide, clientSide] = InMemoryTransport.createLinkedPair();
   await createServer(gw).connect(serverSide);
-  const client = new Client({ name: "test", version: "0" });
+  const client = new Client({ name: "test", version: "0" }, answer ? { capabilities: { elicitation: {} } } : {});
+  if (answer) client.setRequestHandler(ElicitRequestSchema, (req) => answer(req.params));
   await client.connect(clientSide);
   return client;
 }
@@ -162,6 +165,29 @@ test("a write without confirm=true, missing or misspelled, previews and says not
     assert.match(texts(out)[1][1], /^미리보기만 했고 아직 실행하지 않았습니다.*confirm=true/);
   }
   assert.equal(fake.count("sc111A06"), 0);
+});
+
+test("the leave tools ask through a form only when the client can show one, and its pick needs no confirm", async () => {
+  const ROW = { appSq: "501", appDt: "20261028", linkAtCd: "1010", atNm: "연차", approState: "2", startDt: "20261216", endDt: "20261216" };
+  const fake = fakeGroupware((path, calls) => {
+    if (path.endsWith("selectAttendApplicationInfo")) {
+      return { attendApplicationMaster: { appSq: "501", appEmpCd: "12345" }, attendApplicationDetailList: [{ atDt: "20261216" }] };
+    }
+    if (path.endsWith("at00001")) return calls.some((c) => c.path.endsWith("deleteSubmittedApplicationList")) ? [] : [ROW];
+    return { failCnt: 0 };
+  });
+  const asked = [];
+  const out = await (await connect(fake.gw, (params) => {
+    asked.push(params);
+    return { action: "accept", content: { id: "20261028-501" } };
+  })).callTool({ name: "leave_cancel", arguments: {} });
+  assert.equal(asked[0].requestedSchema.properties.id.oneOf[0].const, "20261028-501");
+  assert.equal(out.content.length, 1);   // done: no "not yet" notice
+  assert.match(texts(out)[0][1], /"canceled": true/);
+  assert.equal(fake.count("deleteSubmittedApplicationList"), 1);
+  // without forms: the id and confirm path, unchanged
+  const plain = await (await connect(fake.gw)).callTool({ name: "leave_cancel", arguments: {} });
+  assert.deepEqual([plain.isError, texts(plain)[0][1]], [true, "id에는 leave_requests의 id('YYYYMMDD-번호')를 넣어 주세요."]);
 });
 
 // ---- the bin
