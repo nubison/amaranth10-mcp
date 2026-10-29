@@ -152,6 +152,18 @@ test("a read-back refused for the session after a write is unconfirmed, with one
   }
 });
 
+test("a write without confirm=true, missing or misspelled, previews and says nothing was done", async () => {
+  const fake = fakeGroupware((path) => (path.endsWith("sc111A02") ? { resultList: CALS } : DETAIL));
+  const client = await connect(fake.gw);
+  for (const args of [{ sch_seq: 8439 }, { sch_seq: 8439, confirmed: true }]) {
+    const out = await client.callTool({ name: "schedule_delete", arguments: args });
+    assert.equal(out.isError, undefined);
+    assert.match(texts(out)[0][1], /"sch_seq": 8439/);
+    assert.match(texts(out)[1][1], /^미리보기만 했고 아직 실행하지 않았습니다.*confirm=true/);
+  }
+  assert.equal(fake.count("sc111A06"), 0);
+});
+
 // ---- the bin
 test("server mode writes nothing but MCP frames to stdout", async () => {
   // nothing answers at that address: the startup login is skipped and the server starts

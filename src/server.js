@@ -167,12 +167,17 @@ const TOOLS = [
 // one block; non-strings as 2-space JSON
 const block = (x) => ({ type: "text", text: typeof x === "string" ? x : JSON.stringify(x, null, 2) });
 
+// a preview must not read as done to a model that dropped or misspelled confirm (live 2026-10-28: a model
+// called resource_reserve without confirm, got previews back and took them for a failed booking)
+const NOT_YET = "미리보기만 했고 아직 실행하지 않았습니다. 사용자가 승인하면 같은 인자에 confirm=true를 더해 다시 호출하세요.";
+
 export function createServer(gw) {
   const server = new McpServer({ name: "amaranth10", version: VERSION });
   for (const [name, annotations, fn, inputSchema, description] of TOOLS) {
     server.registerTool(name, { description, inputSchema, annotations }, async (args) => {
       try {
         const out = await gw.call((session, fetch) => fn(session, args, { fetch }));
+        if ("confirm" in inputSchema && args.confirm !== true) return { content: [block(out), block(NOT_YET)] };
         return { content: !Array.isArray(out) ? [block(out)] : out.length ? out.map(block) : [block("[]")] };
       } catch (e) {   // Groupware.call hands back a GroupwareError with Korean text
         return { isError: true, content: [{ type: "text", text: e.message }] };
