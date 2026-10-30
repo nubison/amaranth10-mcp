@@ -505,7 +505,7 @@ const delMail = (api, args = {}) => deleteMail(S, { muids: [9], ...args }, { fet
 test("mail send: a preview shows the mail; confirm posts the compose form once, as the web client fills it", async () => {
   const api = mailApi();
   const preview = { from: "홍길동 <hong@example.com>", to: ["a@example.com", "김민수 <kim@example.com>"],
-    cc: ["lee@example.com"], bcc: [], subject: "보고", body: "안녕\n<b>하세요</b>" };
+    cc: ["lee@example.com"], bcc: [], subject: "보고", body: "안녕\n<b>하세요</b>", signature: null };
   assert.deepEqual(await sendTo(api, { cc: ["lee@example.com"] }), preview);
   assert.deepEqual(writes(api), []);
   assert.deepEqual(await sendTo(api, { cc: ["lee@example.com"], confirm: true }), { ...preview, sent: true });
@@ -533,6 +533,19 @@ test("mail send: html=true sends the body as it is", async () => {
   assert.equal(bodyOf(api, "mail014A04").htmlContents, "안녕\n<b>하세요</b>");
 });
 
+test("mail send: the signature the settings pick goes under the body; signature=true or false overrides them", async () => {
+  const sig = { signature_index: 1, signature_name: "기본값", signature: "<html><head></head><body><b>홍길동</b></body></html>" };
+  const plain = "안녕<br>&lt;b&gt;하세요&lt;/b&gt;";
+  const signed = `${plain}<p><br></p><div class="dze_signature" dze_signature_index="1"><b>홍길동</b></div>`;
+  for (const [signatureIdx, signature, name, contents] of [
+    [1, null, "기본값", signed], [-1, null, null, plain], [-1, true, "기본값", signed], [1, false, null, plain]]) {
+    const api = mailApi({ setup: { ...SETUP, configSignature: { signatureIdx, signatureList: [sig] } } });
+    assert.equal((await sendTo(api, { signature })).signature, name);
+    await sendTo(api, { signature, confirm: true });
+    assert.equal(bodyOf(api, "mail014A04").htmlContents, contents, JSON.stringify([signatureIdx, signature]));
+  }
+});
+
 test("mail send: cc and bcc skip an address already in to or cc", async () => {
   const out = await sendTo(mailApi(), { to: ["a@example.com"], cc: ["A@example.com", "b@example.com"],
     bcc: ["b@example.com", "c@example.com"] });
@@ -554,6 +567,7 @@ test("mail send: refusals send nothing", () => refuses(mailApi, sendTo, [
   [{ cc: ["x@y"] }, {}, /메일 주소가 아닙니다/],
   [{ to: [] }, {}, /받는 사람/],
   [{ subject: "  " }, {}, /제목/],
+  [{ signature: true }, {}, /저장된 서명이 없습니다/],
   [{}, { setup: { ...SETUP, mail_from: [] } }, /보낼 주소가 없습니다/],
   [{}, { setup: { ...SETUP, useLimit: 1 } }, /제한/],
   [{}, { setup: { ...SETUP, recvSendRestiction: "3" } }, /제한/],

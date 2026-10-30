@@ -59,11 +59,14 @@ const TOOLS = [
     + "start/end는 'YYYY-MM-DD'. limit은 여는 최대 건수(1~50). 본문은 mail_read로 본다."],
   ["mail_send", SENDS, write.sendMail,
     { to: lax(z.array(z.string())), cc: listOrNone(z.string()), bcc: listOrNone(z.string()), subject: z.string(),
-      body: str(""), html: flag, confirm: flag },
+      body: str(""), html: flag, signature: lax(orNone(z.boolean())), confirm: flag },
     `메일 보내기. ${APPROVE}\n`
-    + "confirm=false(기본)는 보내지 않고 미리보기(보내는 사람·받는 사람·제목·본문)만 돌려준다.\n"
+    + "confirm=false(기본)는 보내지 않고 미리보기(보내는 사람·받는 사람·제목·본문·서명)만 돌려준다.\n"
     + "to·cc·bcc는 메일 주소 목록('a@b.com' 또는 '이름 <a@b.com>'). 주소를 모르면 사용자에게 물어볼 것. "
-    + "body는 일반 텍스트(줄바꿈 유지). html=true면 body를 HTML로 그대로 보낸다(줄바꿈은 <br>로 직접 넣을 것). "
+    + "body는 일반 텍스트(줄바꿈 유지). 표 같은 서식이 필요하면 html=true로 body를 HTML로 써서 그대로 보낸다. "
+    + "이때 줄바꿈은 \\n이 아니라 <br>이나 <p>로 쓸 것.\n"
+    + "signature를 생략하면 그룹웨어 서명 설정대로 본문 아래에 서명을 붙인다. true면 설정이 꺼져 있어도 저장된 서명을 붙이고, "
+    + "false면 붙이지 않는다. 미리보기의 signature는 붙일 서명 이름(null이면 붙이지 않음). 서명을 body에 직접 넣지 말 것.\n"
     + "첨부·답장·전달은 지원하지 않는다. 보낸 메일은 되돌릴 수 없다.\n"
     + "left_out이 있으면 외부 발송 제한으로 빠진 주소다. "
     + "결과를 확인하지 못했다는 오류가 나면 다시 호출하지 말고, 사용자에게 보낸메일함에서 확인해 달라고 할 것."],

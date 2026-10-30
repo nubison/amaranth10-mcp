@@ -343,7 +343,7 @@ function addresses(list, field) {
 }
 
 export async function sendMail(session, { to, cc = null, bcc = null, subject, body = "", html: asHtml = false,
-  confirm = false } = {},
+  signature = null, confirm = false } = {},
   { fetch, now = () => new Date() } = {}) {
   const toList = addresses(to, "to");
   if (!toList.length) throw new GroupwareError("받는 사람(to)을 한 명 이상 넣어 주세요.");
@@ -371,18 +371,27 @@ export async function sendMail(session, { to, cc = null, bcc = null, subject, bo
   // a representative or shared address goes out under its own name
   const fromName = [init.representInfo, init.sharedList].some((l) => Array.isArray(l) && l.includes(from)) ? ""
     : (names.find((n) => n.isDefault === true) ?? names[0])?.userName ?? "";
+  // the server adds no signature; the web compose page puts the one the settings pick (-1: none) under the body.
+  // signature=true takes the first stored one when the settings pick none
+  const sigs = Array.isArray(init.configSignature?.signatureList) ? init.configSignature.signatureList : [];
+  const sig = signature === false ? null : sigs.find((s) => num(s.signature_index) === num(init.configSignature.signatureIdx))
+    ?? (signature === true ? sigs[0] : null);
+  if (signature === true && !sig) throw new GroupwareError("저장된 서명이 없습니다. 그룹웨어 메일 환경설정에서 서명을 먼저 만들어 주세요.");
   const preview = { from: fromName ? `${fromName} <${from}>` : from, to: toList.map(shown), cc: ccList.map(shown),
-    bcc: bccList.map(shown), subject, body };
+    bcc: bccList.map(shown), subject, body, signature: sig ? String(sig.signature_name ?? "") : null };
   if (confirm !== true) return preview;
 
   const today = now(), days = num(init.bigFileDay) || 30, until = new Date(today);
   until.setDate(until.getDate() + days);
   const group = init.groupMailOption || {};
+  const page = String(sig?.signature ?? ""), inner = /<body[^>]*>([\s\S]*)<\/body>/i.exec(page)?.[1] ?? page;   // stored as a whole page
+  const content = (asHtml === true ? String(body) : html(body))
+    + (sig ? `<p><br></p><div class="dze_signature" dze_signature_index="${num(sig.signature_index)}">${inner}</div>` : "");
   const form = new FormData();
   // every field the web client's compose form sends for a plain mail without attachments, in its order
   for (const [k, v] of [
     ["from", from], ["fromName", fromName], ["to", joined(toList)], ["cc", joined(ccList)], ["bcc", joined(bccList)],
-    ["htmlContents", asHtml === true ? String(body) : html(body)], ["email", init.email], ["fileDir", init.filedir ?? ""], ["bigFile", ""],
+    ["htmlContents", content], ["email", init.email], ["fileDir", init.filedir ?? ""], ["bigFile", ""],
     ["bigFileDay", String(days)], ["bigFileCnt", "0"], ["bigFilePeriod", `${ymd(today)} ~ ${ymd(until)}`],
     ["mail_kind", "plain"], ["uidAuthList", ""], ["fwFile", ""], ["urlList", ""], ["fileNameList", ""],
     ["receipt_notific", user.receiveconfirm === "0" ? "1" : ""],   // the user's "always ask for a receipt"
