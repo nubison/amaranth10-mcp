@@ -527,6 +527,12 @@ test("mail send: a preview shows the mail; confirm posts the compose form once, 
   assert.deepEqual(writes(api), ["mail014A04"]);
 });
 
+test("mail send: html=true sends the body as it is", async () => {
+  const api = mailApi();
+  await sendTo(api, { html: true, confirm: true });
+  assert.equal(bodyOf(api, "mail014A04").htmlContents, "안녕\n<b>하세요</b>");
+});
+
 test("mail send: cc and bcc skip an address already in to or cc", async () => {
   const out = await sendTo(mailApi(), { to: ["a@example.com"], cc: ["A@example.com", "b@example.com"],
     bcc: ["b@example.com", "c@example.com"] });

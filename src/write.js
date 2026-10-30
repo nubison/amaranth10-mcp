@@ -342,7 +342,8 @@ function addresses(list, field) {
   });
 }
 
-export async function sendMail(session, { to, cc = null, bcc = null, subject, body = "", confirm = false } = {},
+export async function sendMail(session, { to, cc = null, bcc = null, subject, body = "", html: asHtml = false,
+  confirm = false } = {},
   { fetch, now = () => new Date() } = {}) {
   const toList = addresses(to, "to");
   if (!toList.length) throw new GroupwareError("받는 사람(to)을 한 명 이상 넣어 주세요.");
@@ -381,7 +382,7 @@ export async function sendMail(session, { to, cc = null, bcc = null, subject, bo
   // every field the web client's compose form sends for a plain mail without attachments, in its order
   for (const [k, v] of [
     ["from", from], ["fromName", fromName], ["to", joined(toList)], ["cc", joined(ccList)], ["bcc", joined(bccList)],
-    ["htmlContents", html(body)], ["email", init.email], ["fileDir", init.filedir ?? ""], ["bigFile", ""],
+    ["htmlContents", asHtml === true ? String(body) : html(body)], ["email", init.email], ["fileDir", init.filedir ?? ""], ["bigFile", ""],
     ["bigFileDay", String(days)], ["bigFileCnt", "0"], ["bigFilePeriod", `${ymd(today)} ~ ${ymd(until)}`],
     ["mail_kind", "plain"], ["uidAuthList", ""], ["fwFile", ""], ["urlList", ""], ["fileNameList", ""],
     ["receipt_notific", user.receiveconfirm === "0" ? "1" : ""],   // the user's "always ask for a receipt"

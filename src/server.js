@@ -59,11 +59,12 @@ const TOOLS = [
     + "start/end는 'YYYY-MM-DD'. limit은 여는 최대 건수(1~50). 본문은 mail_read로 본다."],
   ["mail_send", SENDS, write.sendMail,
     { to: lax(z.array(z.string())), cc: listOrNone(z.string()), bcc: listOrNone(z.string()), subject: z.string(),
-      body: str(""), confirm: flag },
+      body: str(""), html: flag, confirm: flag },
     `메일 보내기. ${APPROVE}\n`
     + "confirm=false(기본)는 보내지 않고 미리보기(보내는 사람·받는 사람·제목·본문)만 돌려준다.\n"
     + "to·cc·bcc는 메일 주소 목록('a@b.com' 또는 '이름 <a@b.com>'). 주소를 모르면 사용자에게 물어볼 것. "
-    + "body는 일반 텍스트(줄바꿈 유지). 첨부·답장·전달은 지원하지 않는다. 보낸 메일은 되돌릴 수 없다.\n"
+    + "body는 일반 텍스트(줄바꿈 유지). html=true면 body를 HTML로 그대로 보낸다(줄바꿈은 <br>로 직접 넣을 것). "
+    + "첨부·답장·전달은 지원하지 않는다. 보낸 메일은 되돌릴 수 없다.\n"
     + "left_out이 있으면 외부 발송 제한으로 빠진 주소다. "
     + "결과를 확인하지 못했다는 오류가 나면 다시 호출하지 말고, 사용자에게 보낸메일함에서 확인해 달라고 할 것."],
   ["mail_delete", WRITES, write.deleteMail, { muids: lax(z.array(strOrInt)), box: str("INBOX"), confirm: flag },
